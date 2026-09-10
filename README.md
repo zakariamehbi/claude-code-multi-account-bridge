@@ -26,6 +26,19 @@ though the conversation itself is right there on disk.
 
 This tool merges those lists.
 
+**Symptoms this fixes:** the Code sidebar is empty or missing sessions after
+switching Claude accounts; sessions disappeared when you signed into your second
+account; you use two Claude accounts on one Mac (a second Max or Pro
+subscription for when the first hits its weekly usage limit, a work Team seat
+and a personal plan) and each one only shows its own history.
+
+**Related tools.** [claude-transplant](https://github.com/vitaliyhayda/claude-transplant)
+*moves* session records to the account you are switching to, with an undo, so
+one account lists each session at a time. This bridge *merges* instead: both
+accounts always list every session, deletions and archive state carry across,
+and nothing has to be run at switch time. Pick by whether you want one list that
+follows you or two lists that stay identical.
+
 ## What it does
 
 `sync` converges every `<account>/<org>` folder to the same set of records:
