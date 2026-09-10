@@ -147,6 +147,11 @@ installer can be re-run to refresh the watch list. Install always boots the labe
 out before bootstrapping (it can be loaded from a plist that has since moved),
 and a failed bootstrap DELETES the plist it just wrote — the old copy is already
 booted out, so a surviving plist would claim an installation that is not running.
+The job runs a COPY of the script placed in the state directory, never the
+checkout: launchd starts `/usr/bin/python3` without the user's privacy grants,
+so a script under `~/Documents`/`~/Desktop`/`~/Downloads` fails with "Operation
+not permitted" on every run (measured on macOS 26; found only by watching a real
+launchd run — every static check was green). `install-agent` refreshes the copy.
 `uninstall-agent` boots it out and deletes the plist; both refuse on a non-macOS
 platform without invoking launchctl at all, and both report an unwritable
 LaunchAgents directory as a clean exit 2 rather than a traceback — install says

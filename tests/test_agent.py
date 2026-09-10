@@ -135,6 +135,49 @@ class AgentCase(unittest.TestCase):
         return [call[1] for call in self.runner.calls]
 
 
+class AgentScriptCopyTest(AgentCase):
+    """launchd runs /usr/bin/python3 WITHOUT the user's privacy grants, so a
+    script that lives under ~/Documents, ~/Desktop or ~/Downloads fails with
+    "Operation not permitted" on every run (measured on macOS 26). The agent
+    therefore runs a copy placed in the state directory, which is never under a
+    protected folder."""
+
+    def source(self):
+        return os.path.join(self.base, "checkout", "bridge.py")
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.dirname(self.source()))
+        with open(self.source(), "wb") as handle:
+            handle.write(b"# the checkout's script\n")
+
+    def test_the_agent_runs_a_copy_inside_the_state_directory(self):
+        self.assertEqual(self.install(script_path=self.source()), 0)
+        with open(self.plist_path(), "rb") as handle:
+            argv = plistlib.load(handle)["ProgramArguments"]
+        copied = os.path.join(self.state_dir, "bridge.py")
+        self.assertEqual(argv[1], copied)
+        with open(copied, "rb") as handle:
+            self.assertEqual(handle.read(), b"# the checkout's script\n")
+
+    def test_reinstall_refreshes_the_copy(self):
+        self.assertEqual(self.install(script_path=self.source()), 0)
+        with open(self.source(), "wb") as handle:
+            handle.write(b"# newer\n")
+        self.assertEqual(self.install(script_path=self.source()), 0)
+        with open(os.path.join(self.state_dir, "bridge.py"), "rb") as handle:
+            self.assertEqual(handle.read(), b"# newer\n")
+
+    def test_an_uncopyable_script_is_a_clean_exit_2_before_any_bootout(self):
+        os.makedirs(self.state_dir)
+        os.chmod(self.state_dir, 0o500)
+        self.addCleanup(os.chmod, self.state_dir, 0o700)
+        with self.assertLogs(bridge.LOGGER, level="ERROR"):
+            self.assertEqual(self.install(script_path=self.source()), 2)
+        self.assertEqual(self.verbs(), [])
+        self.assertFalse(os.path.exists(self.plist_path()))
+
+
 class InstallTest(AgentCase):
     @darwin_only
     def test_install_writes_the_plist_and_bootstraps_it(self):
@@ -148,8 +191,12 @@ class InstallTest(AgentCase):
             parsed = plistlib.loads(handle.read())
         self.assertEqual(parsed["WatchPaths"],
                          [self.root, os.path.dirname(self.leaf), self.leaf])
+        # The agent runs the COPY in the state dir, never the checkout: launchd
+        # has no privacy grant for ~/Documents and the like (AgentScriptCopyTest).
         self.assertEqual(parsed["ProgramArguments"][:2],
-                         ["/usr/bin/python3", os.path.abspath(bridge.__file__)])
+                         ["/usr/bin/python3",
+                          os.path.join(self.state_dir, "bridge.py")])
+        self.assertTrue(os.path.isfile(os.path.join(self.state_dir, "bridge.py")))
         domain = "gui/%d" % os.getuid()
         self.assertEqual(self.runner.calls[-1],
                          ["launchctl", "bootstrap", domain, self.plist_path()])

@@ -147,6 +147,13 @@ up as a change to that account folder. `sync` re-discovers leaves on every run
 regardless, and re-running `install-agent` refreshes the watch list. Logs land
 in `~/Library/Logs/com.claude-code-multi-account-bridge.{out,err}.log`.
 
+The agent does **not** run the script from your checkout. launchd starts
+`/usr/bin/python3` without the privacy grants your terminal has, so a script
+under `~/Documents`, `~/Desktop` or `~/Downloads` fails with `Operation not
+permitted` on every run (measured). `install-agent` therefore copies `bridge.py`
+into `~/.claude-code-multi-account-bridge/` and points the job there. After you
+pull a new version, run `install-agent` again to refresh that copy.
+
 Those two log files are **append-only and never rotated** — launchd does not
 rotate them and neither does this tool. A quiet run writes one line, so they
 grow slowly, but if you leave the agent installed for months, truncate them
@@ -325,7 +332,7 @@ or cron.
 
 ```sh
 python3 bridge.py uninstall-agent            # unload + delete the plist
-rm -rf ~/.claude-code-multi-account-bridge   # backups and lock file
+rm -rf ~/.claude-code-multi-account-bridge   # backups, lock file, the agent's copy of bridge.py
 rm -rf <this clone>
 ```
 

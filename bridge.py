@@ -1669,6 +1669,34 @@ def plist_path(agents_dir):
     return os.path.join(agents_dir, LABEL + ".plist")
 
 
+AGENT_SCRIPT_NAME = "bridge.py"
+
+
+def copy_agent_script(source, state_dir):
+    """Copy the script the agent will run into the state directory.
+
+    Returns the copy's path, or None (after logging) when it cannot be written.
+    Temp file + rename, so a running agent never sees a half-copied script.
+    """
+    target = os.path.join(state_dir, AGENT_SCRIPT_NAME)
+    temp = os.path.join(state_dir, ".%s.tmp-%d" % (AGENT_SCRIPT_NAME, os.getpid()))
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        with open(source, "rb") as handle:
+            payload = handle.read()
+        with open(temp, "wb") as handle:
+            handle.write(payload)
+        os.chmod(temp, 0o700)
+        os.replace(temp, target)
+    except OSError as error:
+        _unlink_quietly(temp)
+        LOGGER.error("cannot place the agent's copy of %s at %s (%s); nothing "
+                     "was installed and nothing was unloaded", source, target,
+                     error)
+        return None
+    return target
+
+
 def install_agent(agents_dir, root, leaves, runner=None, platform=None,
                   user_data=None, state_dir=None, script_path=None, echo=None):
     """Write the plist and (re-)bootstrap it. Returns an exit code."""
@@ -1689,9 +1717,18 @@ def install_agent(agents_dir, root, leaves, runner=None, platform=None,
                      "nothing was installed and nothing was unloaded",
                      agents_dir, error)
         return 2
+    # launchd runs /usr/bin/python3 WITHOUT the user's privacy grants: a script
+    # under ~/Documents, ~/Desktop or ~/Downloads fails with "Operation not
+    # permitted" on every run (measured on macOS 26). So the agent runs a copy
+    # placed in the state directory, which is never under a protected folder.
+    # Done BEFORE the bootout, so a failure here disturbs nothing.
+    agent_script = copy_agent_script(
+        script_path or os.path.abspath(__file__),
+        state_dir or default_state_dir())
+    if agent_script is None:
+        return 2
     payload = plist_bytes(
-        script_path or os.path.abspath(__file__), root, leaves,
-        user_data=user_data, state_dir=state_dir)
+        agent_script, root, leaves, user_data=user_data, state_dir=state_dir)
     domain = "gui/%d" % os.getuid()
     # ALWAYS boot out first, plist or no plist: the label can be loaded from a
     # copy that has since been moved or deleted, and bootstrap then fails with
