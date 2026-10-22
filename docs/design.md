@@ -8,7 +8,7 @@ The Claude desktop app keeps the Code-tab session list per signed-in account:
 <userData>/claude-code-sessions/<accountUuid>/<orgUuid>/
     local_<sessionId>.json     one record per session (title, cwd, isArchived, cliSessionId, ...)
     deleted_<sessionId>        tombstone written when a session is deleted (content: epoch ms)
-    scheduled-tasks.json       per-account, NOT ours
+    scheduled-tasks.json       per-account scheduled-task list (merged, see README)
     backlog/, spaces.json, ... per-account, NOT ours
 ```
 
@@ -173,7 +173,7 @@ than a write.
 ## Non-goals
 
 - claude.ai chat history (server-side per account).
-- `scheduled-tasks.json`, `backlog/`, `spaces.json` and any other per-account files.
+- `backlog/`, `spaces.json` and any other per-account files.
 - The `local-agent-mode-sessions` (Cowork) tree. Same layout; may be added later.
 - Live refresh of a running app. The app shows merged records on its next account
   load or relaunch.

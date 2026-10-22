@@ -645,7 +645,7 @@ LOCK_FILENAME = "bridge.lock"
 BACKUPS_KEPT = 10
 
 SyncResult = collections.namedtuple(
-    "SyncResult", "plan backup applied backup_skipped")
+    "SyncResult", "plan backup applied backup_skipped tasks")
 
 # What take_backup made: the directory, and how many paths it deliberately left
 # out because discovery had already reported them as unreadable (R2-NB2).
@@ -655,7 +655,7 @@ Backup = collections.namedtuple("Backup", "path skipped")
 def empty_applied(errors=0):
     """The applied-counts dict with nothing done (and optionally one failure)."""
     return {"copies_written": 0, "tombstones_copied": 0, "records_deleted": 0,
-            "skipped": 0, "errors": errors}
+            "tasks_written": 0, "skipped": 0, "errors": errors}
 
 
 def default_state_dir():
@@ -1057,7 +1057,245 @@ def log_plan_findings(plan):
         LOGGER.debug("ignored (%s): %s", reason, path)
 
 
-def sync_once(root, execute=False, state_dir=None):
+# ----------------------------------------------------------- scheduled tasks
+#
+# <leaf>/scheduled-tasks.json is the list the desktop app's task scheduler runs
+# from: {"scheduledTasks": [{"id", "filePath", "cronExpression", "enabled",
+# "lastRunAt", ...}], "recordedSkips": {<task id>: [...]}, ...}. The prompt each
+# task points at (filePath, ~/.claude/scheduled-tasks/<id>/SKILL.md) is already
+# shared across accounts; only the list is per account, so a task created on one
+# account never runs, or even shows, while signed into the other.
+#
+# The app holds that list in memory once an account is loaded and rewrites the
+# whole file from memory, so a file written under a running app is overwritten
+# with the list it loaded — and a missing task then reads like a delete. The
+# signed-in account's leaves are therefore only written while the app is not
+# running; every other leaf is written whenever it drifts, so it is current the
+# next time that account loads.
+
+SCHEDULED_TASKS_FILENAME = "scheduled-tasks.json"
+TASKS_KEY = "scheduledTasks"
+SKIPS_KEY = "recordedSkips"
+TASK_ID_FIELD = "id"
+# Run bookkeeping (ISO-8601 UTC strings, so they order as strings). The newest
+# value across copies always wins, so a run on one account is not "missed"
+# again on the other.
+TASK_RUN_FIELDS = ("lastRunAt", "lastScheduledFor")
+# Per leaf, the task ids it held after the last --execute run: a task that was
+# there and is gone now was deleted in the app, and is deleted everywhere.
+TASKS_BASE_FILENAME = "scheduled-tasks-base.json"
+APP_CONFIG_FILENAME = "config.json"
+ACTIVE_ACCOUNT_FIELD = "lastKnownAccountUuid"
+APP_PROCESS_NAME = "Claude"
+
+TasksPlan = collections.namedtuple(
+    "TasksPlan", "files writes deleted held_back tasks")
+
+
+def tasks_path(leaf):
+    return os.path.join(leaf, SCHEDULED_TASKS_FILENAME)
+
+
+def read_scheduled_tasks(leaf):
+    """The leaf's scheduled-tasks.json as a parsed FileEntry, or None.
+
+    None for anything that is not a regular file holding the shape described
+    above: a file this tool does not understand is neither a source nor a
+    destination. The app creates the file when an account loads, so a leaf
+    without one is never given one either.
+    """
+    path = tasks_path(leaf)
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+    except OSError:
+        return None
+    entry, _ = _read_entry(path, name=SCHEDULED_TASKS_FILENAME)
+    if entry is None or entry.parsed is None:
+        return None
+    tasks = entry.parsed.get(TASKS_KEY)
+    if not isinstance(tasks, list) or not all(
+            isinstance(task, dict) and isinstance(task.get(TASK_ID_FIELD), str)
+            for task in tasks):
+        LOGGER.debug("not a scheduled-tasks list this tool understands: %s", path)
+        return None
+    return entry
+
+
+def _task_ids(entry):
+    return {task[TASK_ID_FIELD] for task in entry.parsed[TASKS_KEY]}
+
+
+def _newer_run_fields(merged, task):
+    for field in TASK_RUN_FIELDS:
+        value = task.get(field)
+        if isinstance(value, str) and (not isinstance(merged.get(field), str)
+                                       or value > merged[field]):
+            merged[field] = value
+
+
+def plan_scheduled_tasks(files, base, writable, held_back=()):
+    """Pure merge of every leaf's scheduled-tasks.json. Touches no filesystem.
+
+    files: {leaf: FileEntry} as read_scheduled_tasks returned them; base: {leaf:
+    [task ids]} from the last --execute run; writable: leaves that may be written
+    into; held_back: leaves of the account the running app has loaded.
+
+      * a task id in a leaf's base and missing from that leaf now was deleted
+        there, and is dropped everywhere;
+      * every other task id is kept; its body comes from the leaf whose file is
+        newest (then the larger path, for determinism), and its run fields are
+        the newest across all copies;
+      * recordedSkips and every other top-level key come from the newest file,
+        with skip lists for tasks only another leaf has added in.
+    """
+    ordered = sorted(files.items(), key=lambda pair: (pair[1].mtime_ns, pair[0]),
+                     reverse=True)
+    deleted = set()
+    for leaf, entry in files.items():
+        if leaf in base:
+            deleted |= set(base[leaf]) - _task_ids(entry)
+    tasks = []
+    index = {}
+    skips = {}
+    for _, entry in ordered:
+        for task in entry.parsed[TASKS_KEY]:
+            task_id = task[TASK_ID_FIELD]
+            if task_id in deleted:
+                continue
+            if task_id in index:
+                _newer_run_fields(tasks[index[task_id]], task)
+            else:
+                index[task_id] = len(tasks)
+                tasks.append(dict(task))
+        leaf_skips = entry.parsed.get(SKIPS_KEY)
+        if isinstance(leaf_skips, dict):
+            for task_id, value in leaf_skips.items():
+                if task_id not in deleted and task_id not in skips:
+                    skips[task_id] = value
+    if not ordered:
+        return TasksPlan(files={}, writes=(), deleted=(), held_back=(), tasks=())
+    newest_leaf, newest = ordered[0]
+    merged = dict(newest.parsed)
+    merged[TASKS_KEY] = tasks
+    if SKIPS_KEY in merged or skips:
+        merged[SKIPS_KEY] = skips
+    content = (json.dumps(merged, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    writes = []
+    held = []
+    for leaf in sorted(files):
+        entry = files[leaf]
+        if leaf not in writable or entry.parsed == merged:
+            continue
+        if leaf in held_back:
+            held.append(leaf)
+            continue
+        writes.append(Write(tasks_path(leaf), content, newest.mtime_ns,
+                            tasks_path(newest_leaf), "scheduled-tasks",
+                            (entry.mtime_ns, entry.digest)))
+    return TasksPlan(files=dict(files), writes=tuple(writes),
+                     deleted=tuple(sorted(deleted)), held_back=tuple(held),
+                     tasks=tuple(task[TASK_ID_FIELD] for task in tasks))
+
+
+def load_tasks_base(state_dir):
+    """{leaf: [task ids]} from the last --execute run; {} when there is none."""
+    try:
+        with open(os.path.join(state_dir, TASKS_BASE_FILENAME), "rb") as handle:
+            base = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(base, dict):
+        return {}
+    return {leaf: ids for leaf, ids in base.items() if isinstance(ids, list)}
+
+
+def save_tasks_base(state_dir, leaves):
+    """Record what every leaf holds NOW, re-read after the writes landed."""
+    base = {}
+    for leaf in leaves:
+        entry = read_scheduled_tasks(leaf)
+        if entry is not None:
+            base[leaf] = sorted(_task_ids(entry))
+    path = os.path.join(state_dir, TASKS_BASE_FILENAME)
+    if not base and not os.path.exists(path):
+        return
+    temp = path + ".tmp"
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(temp, "w") as handle:
+            json.dump(base, handle, indent=2, sort_keys=True)
+        os.replace(temp, path)
+    except OSError as error:
+        LOGGER.error("could not save %s: %s", path, error)
+        _unlink_quietly(temp)
+
+
+def active_account(user_data):
+    """The account the desktop app last loaded, from its config.json, or None."""
+    try:
+        with open(os.path.join(user_data, APP_CONFIG_FILENAME), "rb") as handle:
+            config = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    account = config.get(ACTIVE_ACCOUNT_FIELD) if isinstance(config, dict) else None
+    return account.lower() if isinstance(account, str) and is_uuid(account) else None
+
+
+def app_is_running(platform=None):
+    """Whether the desktop app is running. Unknown counts as running: holding a
+    write back costs a delay, writing under a running app can cost tasks."""
+    platform = sys.platform if platform is None else platform
+    if platform != "darwin":
+        return True
+    # `ps`, not `pgrep -x`: measured, pgrep finds nothing from inside a
+    # sandboxed shell while ps still lists the app.
+    try:
+        listing = subprocess.run(["ps", "-axo", "comm="], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return True
+    return any(os.path.basename(line.strip()) == APP_PROCESS_NAME
+               for line in listing.stdout.decode("utf-8", "replace").splitlines())
+
+
+def gather_scheduled_tasks(root, plan, state_dir, app_running=None):
+    """Read, then plan, the scheduled-tasks merge for the leaves of `plan`."""
+    files = {}
+    for leaf in plan.leaves:
+        entry = read_scheduled_tasks(leaf)
+        if entry is not None:
+            files[leaf] = entry
+    blocked = {path for path, _ in plan.blocked_leaves}
+    writable = [leaf for leaf in plan.leaves if leaf not in blocked]
+    held_back = ()
+    account = active_account(os.path.dirname(root))
+    if account is not None:
+        if app_running is None:
+            app_running = app_is_running()
+        if app_running:
+            held_back = [leaf for leaf in plan.leaves
+                         if os.path.basename(os.path.dirname(leaf)).lower() == account]
+    return plan_scheduled_tasks(files, load_tasks_base(state_dir), writable,
+                                held_back)
+
+
+def log_tasks_findings(tasks_plan):
+    for task_id in tasks_plan.deleted:
+        LOGGER.info("scheduled task deleted on one account, removing it "
+                    "everywhere: %s", task_id)
+    for leaf in tasks_plan.held_back:
+        LOGGER.debug("scheduled tasks held back while the app has this account "
+                    "loaded; written once it quits: %s", tasks_path(leaf))
+
+
+def format_tasks_counts(tasks_plan):
+    return "tasks=%d files=%d writes=%d deleted=%d held_back=%d" % (
+        len(tasks_plan.tasks), len(tasks_plan.files), len(tasks_plan.writes),
+        len(tasks_plan.deleted), len(tasks_plan.held_back))
+
+
+def sync_once(root, execute=False, state_dir=None, app_running=None):
     """Plan a sync and, when execute is set, apply it.
 
     A backup is taken only when the plan is non-empty and execute is set, so
@@ -1065,24 +1303,35 @@ def sync_once(root, execute=False, state_dir=None):
     stale-temp-file sweep is the one thing an --execute run does even with
     nothing to apply: it holds the lock, so it is the only safe moment, and a
     converged tree is exactly where a leftover would otherwise sit for ever.
+    The scheduled-tasks base is saved on every --execute run, writes or not:
+    it is what tells a later run that a missing task was deleted.
     """
+    state_dir = state_dir or default_state_dir()
     plan = plan_sync(gather(root))
     log_plan_findings(plan)
+    tasks_plan = gather_scheduled_tasks(root, plan, state_dir, app_running)
+    log_tasks_findings(tasks_plan)
     if not execute:
-        return SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0)
+        return SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0,
+                          tasks=tasks_plan)
     sweep_stale_temp_files(plan.leaves)
-    if plan.is_empty():
-        return SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0)
-    backup = take_backup(root, state_dir or default_state_dir(),
-                         skip_paths=unreadable_paths(plan))
+    if plan.is_empty() and not tasks_plan.writes:
+        save_tasks_base(state_dir, plan.leaves)
+        return SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0,
+                          tasks=tasks_plan)
+    backup = take_backup(root, state_dir, skip_paths=unreadable_paths(plan))
     if backup is None:
         # No backup, no writes: the whole point of the backup is to be able to
         # undo what comes after it. take_backup has already said why.
         return SyncResult(plan=plan, backup=None,
-                          applied=empty_applied(errors=1), backup_skipped=0)
+                          applied=empty_applied(errors=1), backup_skipped=0,
+                          tasks=tasks_plan)
     applied = apply_plan(plan)
+    for write in tasks_plan.writes:
+        _apply_write(write, applied, "tasks_written")
+    save_tasks_base(state_dir, plan.leaves)
     return SyncResult(plan=plan, backup=backup.path, applied=applied,
-                      backup_skipped=backup.skipped)
+                      backup_skipped=backup.skipped, tasks=tasks_plan)
 
 
 # --------------------------------------------------------------- environment
@@ -1514,12 +1763,14 @@ def cmd_sync(args):
         return 2
     mode = "execute" if execute else "dry-run"
     print("sync (%s): %s" % (mode, _format_counts(result.plan.counts())))
+    if result.tasks.files:
+        print("scheduled tasks: %s" % format_tasks_counts(result.tasks))
     if result.backup:
         # `skipped` here counts paths left OUT OF THE BACKUP because they could
         # not be read (R2-NB2) — not the `skipped` on the applied line below,
         # which counts writes refused at the last moment.
         print("backup: %s skipped=%d" % (result.backup, result.backup_skipped))
-    if not execute and not result.plan.is_empty():
+    if not execute and not (result.plan.is_empty() and not result.tasks.writes):
         print("nothing was written; re-run with --execute to apply this plan")
     if result.applied:
         # The plan says what SHOULD happen; this says what did. They differ
@@ -1534,7 +1785,7 @@ def cmd_sync(args):
 
 def _format_applied(applied):
     order = ("copies_written", "tombstones_copied", "records_deleted",
-             "skipped", "errors")
+             "tasks_written", "skipped", "errors")
     return " ".join("%s=%d" % (key, applied[key]) for key in order)
 
 
@@ -1558,6 +1809,13 @@ def cmd_status(args, runner):
     # something needed doing made "every leaf is in sync" mean two very
     # different things.
     print("counts: %s" % _format_counts(plan.counts()))
+    tasks_plan = gather_scheduled_tasks(root, plan, state_dir)
+    log_tasks_findings(tasks_plan)
+    print("scheduled tasks: %s" % format_tasks_counts(tasks_plan))
+    for write in tasks_plan.writes:
+        print("  would write  %s" % write.dest)
+    for leaf in tasks_plan.held_back:
+        print("  held back    %s (app has this account loaded)" % tasks_path(leaf))
     if plan.is_empty():
         print("drift: none - every leaf is in sync")
     else:

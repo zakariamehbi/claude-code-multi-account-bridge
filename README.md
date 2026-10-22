@@ -11,7 +11,7 @@ account*. Each account gets its own folder:
 <userData>/claude-code-sessions/<accountUuid>/<orgUuid>/
     local_<sessionId>.json     one record per session (title, cwd, isArchived, ...)
     deleted_<sessionId>        tombstone written when a session is deleted
-    scheduled-tasks.json       per-account — not ours
+    scheduled-tasks.json       the scheduled-task list — merged too, see below
     backlog/, spaces.json      per-account — not ours
 ```
 
@@ -213,6 +213,29 @@ For each session id found in any leaf folder:
 7. **Converged means zero writes.** Winners are written with the winner's
    mtime, so a second run finds nothing to do.
 
+## Scheduled tasks
+
+The Code tab's scheduled tasks are listed per account too, in
+`scheduled-tasks.json` next to the session records. The prompt each task runs
+(`~/.claude/scheduled-tasks/<id>/SKILL.md`) is shared, but a task created on one
+account never shows, and never runs, on the other. `sync` merges that list:
+
+- **Union by task `id`.** The task body comes from the newest file; `lastRunAt`
+  and `lastScheduledFor` take the newest value across copies, so a run on one
+  account is not treated as missed on the other.
+- **Deletes carry across.** After each `--execute` run the task ids every folder
+  holds are saved to `~/.claude-code-multi-account-bridge/scheduled-tasks-base.json`;
+  a task that was in a folder and is gone now was deleted in the app, and is
+  removed everywhere. With no saved state yet, nothing counts as deleted.
+- **The signed-in account waits for the app to quit.** The app keeps the list in
+  memory and rewrites the whole file from it, so a file written under it would be
+  overwritten. The folders of the account in `config.json`'s
+  `lastKnownAccountUuid` are written only while the app is not running
+  (`held_back` on the `scheduled tasks:` line); every other account's folder is
+  kept current, so it is right the next time that account loads.
+- A folder with no `scheduled-tasks.json`, or one in a shape this tool does not
+  recognise, is left alone.
+
 ## Safety
 
 - **Dry run is the default.** `sync` alone only reports; writing needs
@@ -271,8 +294,8 @@ For each session id found in any leaf folder:
   deleted. Both are counted in `blocked_leaves` and named in the log on every
   run. Without this the plan could never converge, which meant a full backup and
   a fresh temp file on every single run.
-- **Nothing else in the session folders is touched.** Only `local_<uuid>.json`
-  and `deleted_<uuid>` are read or written. `scheduled-tasks.json`, `backlog/`,
+- **Nothing else in the session folders is touched.** Only `local_<uuid>.json`,
+  `deleted_<uuid>` and `scheduled-tasks.json` are read or written. `backlog/`,
   `spaces.json` and any other file in those folders are left exactly as they
   were — bytes and timestamps.
 - **What the tool removes, exhaustively.** In your session folders: a
@@ -356,8 +379,7 @@ as its own.
 ## Not in scope
 
 - claude.ai chat history (server-side, and genuinely per account).
-- `scheduled-tasks.json`, `backlog/`, `spaces.json`, and every other
-  per-account file.
+- `backlog/`, `spaces.json`, and every other per-account file.
 - The `local-agent-mode-sessions` tree — same layout, may be added later.
 - Live refresh of a running app.
 
