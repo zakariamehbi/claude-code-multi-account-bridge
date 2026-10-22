@@ -112,10 +112,15 @@ RECORD_PREFIX = "local_"
 RECORD_SUFFIX = ".json"
 TOMBSTONE_PREFIX = "deleted_"
 THROTTLE_INTERVAL = 5
-# A periodic floor: the app reads its folder on account load, which writes
-# nothing, so a switch after a quiet stretch needs a run that no WatchPaths
-# event triggers. A converged tree costs a run nothing (no writes, no backup).
-START_INTERVAL = 60
+# How often launchd starts the job. Most starts end in the --if-changed fast
+# path (a few stats and one `ps`), so this mostly decides how soon a quit app
+# or an account switch is noticed: the app's own files can only be written
+# once it has quit, and it writes nothing on an account switch.
+START_INTERVAL = 10
+# A full sync at least this often even when nothing looks changed: the
+# fingerprint only sees directory mtimes and a few files, and a record the app
+# rewrites in place changes neither.
+FULL_RUN_INTERVAL = 60
 
 # Every "we could not read this" reason starts with this word, and nothing else
 # does: the backup skips exactly those paths (R2-NB2), so the prefix is a
@@ -646,6 +651,15 @@ TEMP_PREFIX = ".bridge-tmp-"
 BACKUPS_DIRNAME = "backups"
 LOCK_FILENAME = "bridge.lock"
 BACKUPS_KEPT = 10
+# A full snapshot of a tree is ~100 MB on a real install and a busy day has
+# hundreds of runs that write, so a full copy per run kept only minutes of
+# history in the ring. One full snapshot per tree per day, plus, before every
+# run that writes, a copy of just the files that run overwrites or removes.
+FULL_BACKUP_INTERVAL = datetime.timedelta(hours=24)
+CHANGES_SUFFIX = "-changes"
+CHANGES_KEPT = 2000
+STAMP_FORMAT = "%Y%m%dT%H%M%S%fZ"
+STAMP_RE = re.compile(r"^[0-9]{8}T[0-9]{12}Z$")
 
 SyncResult = collections.namedtuple(
     "SyncResult", "plan backup applied backup_skipped tasks dirs")
@@ -692,7 +706,7 @@ def apply_plan(plan):
     return applied
 
 
-def sweep_stale_temp_files(leaves):
+def sweep_stale_temp_files(leaves, recursive=False):
     """Remove leftover `.bridge-tmp-*` files from EVERY leaf that was read.
 
     A run killed mid-write leaves one behind, in the very folder the desktop app
@@ -708,13 +722,17 @@ def sweep_stale_temp_files(leaves):
     directory, never a symlink.
     """
     removed = []
-    for leaf in leaves:
+    pending = list(leaves)
+    while pending:
+        leaf = pending.pop()
         try:
             with os.scandir(leaf) as entries:
                 children = list(entries)
         except OSError:
             continue
         for entry in children:
+            if recursive and entry.is_dir(follow_symlinks=False):
+                pending.append(entry.path)
             if not entry.name.startswith(TEMP_PREFIX):
                 continue
             if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
@@ -929,7 +947,7 @@ def take_backup(root, state_dir, now=None, skip_paths=()):
     # timezone-aware UTC: datetime.utcnow() is deprecated from 3.12 on, and
     # the fixed-width stamp makes plain name sorting chronological.
     stamp = (now or datetime.datetime.now(datetime.timezone.utc)).strftime(
-        "%Y%m%dT%H%M%S%fZ")
+        STAMP_FORMAT)
     destination = os.path.join(backups_root, stamp)
     skipped = []
     try:
@@ -952,8 +970,9 @@ def take_backup(root, state_dir, now=None, skip_paths=()):
     return Backup(destination, len(skipped))
 
 
-def prune_backups(backups_root, keep=BACKUPS_KEPT):
-    """Delete all but the newest `keep` backups (names sort chronologically).
+def prune_backups(backups_root, keep=BACKUPS_KEPT, changes_kept=CHANGES_KEPT):
+    """Delete all but the newest `keep` full backups and the newest
+    `changes_kept` change backups (names sort chronologically).
 
     R2-NB1: a SYMLINK named like a timestamp is not a backup. os.path.isdir
     follows links, so one used to be counted as a backup and then handed to
@@ -962,7 +981,8 @@ def prune_backups(backups_root, keep=BACKUPS_KEPT):
     reported, and they do not take up a slot in the ring either.
     """
     try:
-        names = []
+        full = []
+        changes = []
         for name in sorted(os.listdir(backups_root)):
             path = os.path.join(backups_root, name)
             if os.path.islink(path):
@@ -970,16 +990,69 @@ def prune_backups(backups_root, keep=BACKUPS_KEPT):
                                "this tool wrote", path)
                 continue
             if os.path.isdir(path):
-                names.append(name)
+                (changes if name.endswith(CHANGES_SUFFIX) else full).append(name)
     except OSError:
         return []
-    doomed = names[:-keep] if keep > 0 else names
+    doomed = (full[:-keep] if keep > 0 else full) + (
+        changes[:-changes_kept] if changes_kept > 0 else changes)
     removed = []
     for name in doomed:
         if _force_rmtree(os.path.join(backups_root, name)):
             removed.append(name)
             LOGGER.debug("pruned old backup %s", name)
     return removed
+
+
+def _newest_full_backup(backups_root, tree_name):
+    """The datetime of the newest full backup holding `tree_name`, or None."""
+    try:
+        names = sorted(os.listdir(backups_root), reverse=True)
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(backups_root, name)
+        if (STAMP_RE.match(name) and not os.path.islink(path)
+                and os.path.isdir(os.path.join(path, tree_name))):
+            return datetime.datetime.strptime(name, STAMP_FORMAT).replace(
+                tzinfo=datetime.timezone.utc)
+    return None
+
+
+def needs_full_backup(root, state_dir, now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    newest = _newest_full_backup(os.path.join(state_dir, BACKUPS_DIRNAME),
+                                 os.path.basename(root))
+    return newest is None or now - newest >= FULL_BACKUP_INTERVAL
+
+
+def backup_changes(state_dir, base_dir, paths, now=None):
+    """Copy aside, bytes and mtime, every existing file about to be overwritten
+    or removed, at its path relative to base_dir. A Backup, or None when a copy
+    failed (the half-written directory is removed and nothing may be applied).
+    """
+    backups_root = os.path.join(state_dir, BACKUPS_DIRNAME)
+    stamp = (now or datetime.datetime.now(datetime.timezone.utc)).strftime(STAMP_FORMAT)
+    destination = os.path.join(backups_root, stamp + CHANGES_SUFFIX)
+    try:
+        os.makedirs(destination, exist_ok=True)
+        for path in sorted(set(paths)):
+            try:
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    continue
+            except FileNotFoundError:
+                continue
+            target = os.path.join(destination, os.path.relpath(path, base_dir))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(path, target)
+    except OSError as error:
+        LOGGER.error("backup of the files about to change failed, nothing will "
+                     "be applied: %s", error)
+        _force_rmtree(destination)
+        return None
+    finally:
+        prune_backups(backups_root)
+    LOGGER.debug("changed files backed up to %s", destination)
+    return Backup(destination, 0)
 
 
 def _force_rmtree(path):
@@ -1138,7 +1211,7 @@ def _newer_run_fields(merged, task):
             merged[field] = value
 
 
-def plan_scheduled_tasks(files, base, writable, held_back=()):
+def plan_scheduled_tasks(files, base, writable, held_back=(), pending=()):
     """Pure merge of every leaf's scheduled-tasks.json. Touches no filesystem.
 
     files: {leaf: FileEntry} as read_scheduled_tasks returned them; base: {leaf:
@@ -1146,7 +1219,9 @@ def plan_scheduled_tasks(files, base, writable, held_back=()):
     into; held_back: leaves of the account the running app has loaded.
 
       * a task id in a leaf's base and missing from that leaf now was deleted
-        there, and is dropped everywhere;
+        there, and is dropped everywhere; so is every id in `pending`, a
+        deletion an earlier run could not finish (a held-back, blocked or
+        changed-under-us leaf still had it);
       * every other task id is kept; its body comes from the leaf whose file is
         newest (then the larger path, for determinism), and its run fields are
         the newest across all copies;
@@ -1155,7 +1230,7 @@ def plan_scheduled_tasks(files, base, writable, held_back=()):
     """
     ordered = sorted(files.items(), key=lambda pair: (pair[1].mtime_ns, pair[0]),
                      reverse=True)
-    deleted = set()
+    deleted = set(pending)
     for leaf, entry in files.items():
         if leaf in base:
             deleted |= set(base[leaf]) - _task_ids(entry)
@@ -1233,20 +1308,45 @@ def load_tasks_base(state_dir):
     return {leaf: ids for leaf, ids in base.items() if isinstance(ids, list)}
 
 
-def save_tasks_base(state_dir, leaves):
-    """Record what these leaves hold NOW, re-read after the writes landed.
+def save_tasks_base(state_dir, leaves, root, deleted=()):
+    """Record what these leaves hold NOW, re-read after the writes landed, and
+    keep every deletion some leaf still holds pending for the next run.
 
+    The base alone is not enough: re-read from disk, it forgets a deletion
+    that could not reach a held-back or blocked leaf, and the next run would
+    read that leaf's stale copy as live and write it back everywhere.
     Entries for leaves of another root (the Cowork tree shares this file) are
     kept as they are.
     """
     base = load_tasks_base(state_dir)
+    still_held = set()
     for leaf in leaves:
         entry = read_scheduled_tasks(leaf)
         if entry is not None:
-            base[leaf] = sorted(_task_ids(entry))
+            ids = _task_ids(entry)
+            base[leaf] = sorted(ids)
+            still_held |= ids & set(deleted)
         else:
             base.pop(leaf, None)
     save_state_json(state_dir, TASKS_BASE_FILENAME, base)
+    save_pending(state_dir, "tasks\n" + root, still_held)
+
+
+PENDING_FILENAME = "pending-deletions.json"
+
+
+def load_pending(state_dir, key):
+    ids = load_state_json(state_dir, PENDING_FILENAME).get(key)
+    return set(ids) if isinstance(ids, list) else set()
+
+
+def save_pending(state_dir, key, ids):
+    pending = load_state_json(state_dir, PENDING_FILENAME)
+    if ids:
+        pending[key] = sorted(ids)
+    else:
+        pending.pop(key, None)
+    save_state_json(state_dir, PENDING_FILENAME, pending)
 
 
 def active_account(user_data):
@@ -1278,19 +1378,21 @@ def app_is_running(platform=None):
 
 
 def held_back_leaves(root, leaves, app_running=None):
-    """Leaves of the account the running app has loaded: written only once it quits."""
-    account = active_account(os.path.dirname(root))
-    if account is None:
-        return ()
+    """Leaves of the account the running app has loaded: written only once it
+    quits. With the app running and no readable account, every leaf: the one
+    it has loaded is unknown, and writing under it can cost data."""
     if app_running is None:
         app_running = app_is_running()
     if not app_running:
         return ()
+    account = active_account(os.path.dirname(root))
+    if account is None:
+        return tuple(leaves)
     return tuple(leaf for leaf in leaves
                  if os.path.basename(os.path.dirname(leaf)).lower() == account)
 
 
-def gather_scheduled_tasks(plan, state_dir, held_back):
+def gather_scheduled_tasks(plan, state_dir, held_back, root):
     """Read, then plan, the scheduled-tasks merge for the leaves of `plan`."""
     files = {}
     for leaf in plan.leaves:
@@ -1300,7 +1402,7 @@ def gather_scheduled_tasks(plan, state_dir, held_back):
     blocked = {path for path, _ in plan.blocked_leaves}
     writable = [leaf for leaf in plan.leaves if leaf not in blocked]
     return plan_scheduled_tasks(files, load_tasks_base(state_dir), writable,
-                                held_back)
+                                held_back, load_pending(state_dir, "tasks\n" + root))
 
 
 def log_tasks_findings(tasks_plan):
@@ -1344,15 +1446,20 @@ def _dir_key(leaf, sub):
 def read_leaf_dir(leaf, sub):
     """{relative path: FileEntry} for every regular file under leaf/sub.
 
-    None when leaf/sub is not a real directory (absent, or a symlink): such a
-    folder is a destination only if some other leaf has files for it. Symlinks
-    and this tool's own temp files are never read; an unreadable file is left
-    out and logged, and its path is returned in the second slot so nothing is
-    planned for it anywhere.
+    (None, ()) when leaf/sub does not exist. (None, ("",)) when something that
+    is not a real directory sits there (a symlink, a file): that leaf is then
+    neither a source nor a destination for the folder. Symlinks and this
+    tool's own temp files are never read. An unreadable file, or a directory
+    that cannot be listed, is left out and logged, and its relative path is
+    returned in the second slot: nothing is written there, and nothing under
+    it counts as deleted from this leaf.
     """
     top = os.path.join(leaf, sub)
-    if os.path.islink(top) or not os.path.isdir(top):
+    if not os.path.lexists(top):
         return None, ()
+    if os.path.islink(top) or not os.path.isdir(top):
+        LOGGER.warning("not a real directory, left alone: %s", top)
+        return None, ("",)
     files = {}
     blocked = []
     pending = [""]
@@ -1382,29 +1489,52 @@ def read_leaf_dir(leaf, sub):
     return files, tuple(blocked)
 
 
-def plan_leaf_dirs(dirs, base, writable, held_back=()):
+def _under(rel, prefixes):
+    """True when rel IS one of prefixes or lives under one ("" covers all)."""
+    return any(prefix == "" or rel == prefix or rel.startswith(prefix + os.sep)
+               for prefix in prefixes)
+
+
+def plan_leaf_dirs(dirs, base, writable, held_back=(), pending=None):
     """Pure merge of the LEAF_DIRS folders. Touches no filesystem.
 
     dirs: {(leaf, sub): ({rel: FileEntry} or None, blocked rels)}; base:
-    {_dir_key(leaf, sub): [rels]} from the last --execute run.
+    {_dir_key(leaf, sub): [rels]} from the last --execute run; pending: {sub:
+    rels} deletions an earlier run could not finish everywhere.
+
+    A leaf whose folder is gone but whose base lists files counts as having
+    emptied it (the app removes an empty waiting-input/): reading it as
+    "unknown" would bring back, and re-send, what it consumed.
     """
+    pending = pending or {}
     writes = []
     deletes = []
     held = set()
     deleted_all = []
     file_count = 0
     for sub in LEAF_DIRS:
-        present = {leaf: files for (leaf, s), (files, _) in dirs.items()
-                   if s == sub and files is not None}
-        blocked = {rel for (leaf, s), (_, rels) in dirs.items() if s == sub
-                   for rel in rels}
-        deleted = set()
+        present = {}
+        broken = set()
+        blocked_in = {}
+        for (leaf, s), (files, rels) in dirs.items():
+            if s != sub:
+                continue
+            blocked_in[leaf] = rels
+            if files is not None:
+                present[leaf] = files
+            elif "" in rels:
+                broken.add(leaf)
+            elif isinstance(base.get(_dir_key(leaf, sub)), list):
+                present[leaf] = {}
+        blocked = [rel for rels in blocked_in.values() for rel in rels]
+        deleted = set(pending.get(sub, ()))
         for leaf, files in present.items():
             known = base.get(_dir_key(leaf, sub))
             if isinstance(known, list):
-                deleted |= set(known) - set(files)
-        deleted -= blocked
-        rels = {rel for files in present.values() for rel in files} - deleted - blocked
+                deleted |= {rel for rel in set(known) - set(files)
+                            if not _under(rel, blocked_in[leaf])}
+        rels = {rel for files in present.values() for rel in files
+                if not _under(rel, blocked)} - deleted
         if not rels and not deleted:
             continue
         file_count += len(rels)
@@ -1415,6 +1545,8 @@ def plan_leaf_dirs(dirs, base, writable, held_back=()):
             source_leaf, winner = max(holders, key=lambda pair: (
                 pair[1].mtime_ns, pair[1].digest, pair[0]))
             for leaf in writable:
+                if leaf in broken:
+                    continue
                 current = present.get(leaf, {}).get(rel)
                 if (current is not None and current.content == winner.content
                         and current.mtime_ns == winner.mtime_ns):
@@ -1430,7 +1562,7 @@ def plan_leaf_dirs(dirs, base, writable, held_back=()):
                                     "leaf-dir", expected))
         for rel in sorted(deleted):
             for leaf in writable:
-                if rel not in present.get(leaf, {}):
+                if rel not in present.get(leaf, {}) or _under(rel, blocked):
                     continue
                 if leaf in held_back:
                     held.add(leaf)
@@ -1441,37 +1573,75 @@ def plan_leaf_dirs(dirs, base, writable, held_back=()):
                     deleted=tuple(deleted_all), held_back=tuple(sorted(held)))
 
 
-def gather_leaf_dirs(plan, state_dir, held_back):
+def _dirs_pending_key(root, sub):
+    return "dirs\n%s\n%s" % (root, sub)
+
+
+def gather_leaf_dirs(plan, state_dir, held_back, root):
     dirs = {}
     for leaf in plan.leaves:
         for sub in LEAF_DIRS:
             dirs[(leaf, sub)] = read_leaf_dir(leaf, sub)
     blocked = {path for path, _ in plan.blocked_leaves}
     writable = [leaf for leaf in plan.leaves if leaf not in blocked]
+    pending = {sub: load_pending(state_dir, _dirs_pending_key(root, sub))
+               for sub in LEAF_DIRS}
     return plan_leaf_dirs(dirs, load_state_json(state_dir, DIRS_BASE_FILENAME),
-                          writable, held_back)
+                          writable, held_back, pending)
 
 
-def save_dirs_base(state_dir, leaves):
+def save_dirs_base(state_dir, leaves, root, deleted=()):
+    """What every leaf folder holds now, plus the deletions some leaf still
+    holds (see save_tasks_base). A folder that is not a real directory, or that
+    could not be fully read, keeps its previous entry."""
     base = load_state_json(state_dir, DIRS_BASE_FILENAME)
+    still_held = {sub: set() for sub in LEAF_DIRS}
+    deleted_by_sub = {sub: set() for sub in LEAF_DIRS}
+    for path in deleted:
+        sub, _, rel = path.partition(os.sep)
+        deleted_by_sub.setdefault(sub, set()).add(rel)
     for leaf in leaves:
         for sub in LEAF_DIRS:
-            files, _ = read_leaf_dir(leaf, sub)
-            if files is None:
-                base.pop(_dir_key(leaf, sub), None)
-            else:
-                base[_dir_key(leaf, sub)] = sorted(files)
+            files, blocked = read_leaf_dir(leaf, sub)
+            key = _dir_key(leaf, sub)
+            if files is None and not blocked:
+                if key in base:
+                    base[key] = []
+                continue
+            if files is None or blocked:
+                still_held[sub] |= deleted_by_sub[sub]
+                continue
+            base[key] = sorted(files)
+            still_held[sub] |= set(files) & deleted_by_sub[sub]
     save_state_json(state_dir, DIRS_BASE_FILENAME, base)
+    for sub in LEAF_DIRS:
+        save_pending(state_dir, _dirs_pending_key(root, sub), still_held[sub])
 
 
-def _apply_dir_write(write, applied):
-    parent = os.path.dirname(write.dest)
-    try:
-        os.makedirs(parent, exist_ok=True)
-    except OSError as error:
-        LOGGER.error("cannot create %s: %s", parent, error)
-        applied["errors"] += 1
+def _apply_dir_write(write, applied, leaves):
+    """Create the folders down to write.dest one level at a time, never through
+    a symlink (os.makedirs follows one, and would write outside the leaf)."""
+    leaf = next((leaf for leaf in leaves
+                 if write.dest.startswith(leaf + os.sep)), None)
+    if leaf is None:
+        LOGGER.error("refusing to write %s: not inside a leaf", write.dest)
+        applied["skipped"] += 1
         return
+    path = leaf
+    for part in os.path.relpath(os.path.dirname(write.dest), leaf).split(os.sep):
+        path = os.path.join(path, part)
+        if os.path.islink(path) or (os.path.lexists(path) and not os.path.isdir(path)):
+            LOGGER.warning("skipping %s: %s is not a real directory",
+                           write.dest, path)
+            applied["skipped"] += 1
+            return
+        if not os.path.lexists(path):
+            try:
+                os.mkdir(path)
+            except OSError as error:
+                LOGGER.error("cannot create %s: %s", path, error)
+                applied["errors"] += 1
+                return
     _apply_write(write, applied, "dir_files_written")
 
 
@@ -1520,20 +1690,28 @@ def sync_once(root, execute=False, state_dir=None, app_running=None):
     plan = plan_sync(gather(root))
     log_plan_findings(plan)
     held = held_back_leaves(root, plan.leaves, app_running)
-    tasks_plan = gather_scheduled_tasks(plan, state_dir, held)
+    tasks_plan = gather_scheduled_tasks(plan, state_dir, held, root)
     log_tasks_findings(tasks_plan)
-    dirs_plan = gather_leaf_dirs(plan, state_dir, held)
+    dirs_plan = gather_leaf_dirs(plan, state_dir, held, root)
     result = SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0,
                         tasks=tasks_plan, dirs=dirs_plan)
     if not execute:
         return result
     sweep_stale_temp_files(plan.leaves)
+    sweep_stale_temp_files([os.path.join(leaf, sub) for leaf in plan.leaves
+                            for sub in LEAF_DIRS], recursive=True)
     if plan.is_empty() and not tasks_plan.writes and not (
             dirs_plan.writes or dirs_plan.deletes):
-        save_tasks_base(state_dir, plan.leaves)
-        save_dirs_base(state_dir, plan.leaves)
+        save_tasks_base(state_dir, plan.leaves, root, tasks_plan.deleted)
+        save_dirs_base(state_dir, plan.leaves, root, dirs_plan.deleted)
         return result
-    backup = take_backup(root, state_dir, skip_paths=unreadable_paths(plan))
+    if needs_full_backup(root, state_dir):
+        backup = take_backup(root, state_dir, skip_paths=unreadable_paths(plan))
+    else:
+        backup = backup_changes(state_dir, os.path.dirname(root), [
+            write.dest for write in (plan.writes + plan.tombstone_copies
+                                     + tasks_plan.writes + dirs_plan.writes)
+        ] + [delete.path for delete in plan.deletes + dirs_plan.deletes])
     if backup is None:
         # No backup, no writes: the whole point of the backup is to be able to
         # undo what comes after it. take_backup has already said why.
@@ -1542,11 +1720,11 @@ def sync_once(root, execute=False, state_dir=None, app_running=None):
     for write in tasks_plan.writes:
         _apply_write(write, applied, "tasks_written")
     for write in dirs_plan.writes:
-        _apply_dir_write(write, applied)
+        _apply_dir_write(write, applied, plan.leaves)
     for delete in dirs_plan.deletes:
         _apply_dir_delete(delete, applied)
-    save_tasks_base(state_dir, plan.leaves)
-    save_dirs_base(state_dir, plan.leaves)
+    save_tasks_base(state_dir, plan.leaves, root, tasks_plan.deleted)
+    save_dirs_base(state_dir, plan.leaves, root, dirs_plan.deleted)
     return result._replace(backup=backup.path, applied=applied,
                            backup_skipped=backup.skipped)
 
@@ -1571,7 +1749,6 @@ def sync_once(root, execute=False, state_dir=None, app_running=None):
 # run yet), the loaded account's value wins, then the largest.
 
 APP_FILES_BASE_FILENAME = "app-files-base.json"
-APP_FILES_BACKUP_DIRNAME = "app-files"
 
 # (scope id, file, path to the map inside it, key kind, merge kind)
 #   key kind "account": the map's keys are account uuids;
@@ -1644,12 +1821,12 @@ def _scope_families(node, key_kind, accounts, account_orgs):
 
 def _merge_values(values, base, merge_kind, active):
     """One merged value for a family. values: {key: (account, value)}."""
-    changed = sorted(key for key, (_, value) in values.items()
-                     if base.get(key) != _digest_value(value))
-    if base and changed:
-        pool = changed
-    else:
-        pool = sorted(values)
+    # A key with no saved digest is new (an account that just signed in, a new
+    # org): it holds the app's default, not a choice, so it never counts as a
+    # change and adopts the value the known keys agree on.
+    known = sorted(key for key in values if key in base)
+    changed = [key for key in known if base[key] != _digest_value(values[key][1])]
+    pool = changed or known or sorted(values)
 
     # With nothing to say which copy is newer, the account the app last loaded
     # is the one the user has been looking at; then the copy holding more.
@@ -1692,10 +1869,17 @@ def _merge_values(values, base, merge_kind, active):
             if preset_id not in by_id:
                 order.append(preset_id)
                 by_id[preset_id] = preset
-            elif (preset.get("lastUsedAt") or 0) > (by_id[preset_id].get("lastUsedAt") or 0):
+            elif _last_used(preset) > _last_used(by_id[preset_id]):
                 by_id[preset_id] = preset
     merged["presets"] = [by_id[preset_id] for preset_id in order]
     return merged
+
+
+def _last_used(preset):
+    value = preset.get("lastUsedAt")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return float("-inf")
+    return float(value)
 
 
 def _value_ok(value, merge_kind):
@@ -1830,25 +2014,6 @@ def save_app_files_base(user_data, leaves, state_dir):
     accounts, pairs = _accounts_and_orgs(leaves)
     save_state_json(state_dir, APP_FILES_BASE_FILENAME,
                     app_files_base(files, accounts, pairs))
-
-
-def backup_app_files(state_dir, writes):
-    """Copy every app file about to be rewritten aside, bytes and mtime."""
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backups_root = os.path.join(state_dir, BACKUPS_DIRNAME)
-    destination = os.path.join(backups_root, stamp, APP_FILES_BACKUP_DIRNAME)
-    try:
-        os.makedirs(destination)
-        for write in writes:
-            shutil.copy2(write.dest, destination)
-    except OSError as error:
-        LOGGER.error("backup of the app files failed, nothing will be applied: %s",
-                     error)
-        _force_rmtree(os.path.dirname(destination))
-        return None
-    finally:
-        prune_backups(backups_root)
-    return os.path.dirname(destination)
 
 
 def format_app_counts(app_plan):
@@ -2155,6 +2320,11 @@ def build_parser():
                       help="report what would change and write nothing (default)")
     mode.add_argument("--execute", action="store_true",
                       help="actually write, after taking a backup")
+    sync.add_argument("--if-changed", action="store_true",
+                      help="(for the agent) exit at once when nothing on disk "
+                           "or in the app's state moved since the last run and "
+                           "the last full run is recent; print only runs that "
+                           "did something")
 
     status = subparsers.add_parser(
         "status", help="list the leaves, their counts and the current drift")
@@ -2281,18 +2451,93 @@ def sync_app_files(user_data, leaves, state_dir, execute=False, app_running=None
     plan = gather_app_files(user_data, leaves, state_dir, app_running)
     if not execute:
         return plan, None, None
+    sweep_stale_temp_files([user_data])
+    # The base is what says which account changed a value. Saved while writes
+    # are held back (or after one was refused), it would absorb those changes
+    # and the next run would no longer know they were changes at all.
     if not plan.writes:
-        if plan.files:
+        if plan.files and not plan.held_back:
             save_app_files_base(user_data, leaves, state_dir)
         return plan, None, None
-    backup = backup_app_files(state_dir, plan.writes)
+    backup = backup_changes(state_dir, user_data,
+                            [write.dest for write in plan.writes])
     if backup is None:
         return plan, None, empty_applied(errors=1)
+    backup = backup.path
     applied = empty_applied()
     for write in plan.writes:
         _apply_write(write, applied, "app_files_written")
-    save_app_files_base(user_data, leaves, state_dir)
+    if not (applied["skipped"] or applied["errors"]):
+        save_app_files_base(user_data, leaves, state_dir)
     return plan, backup, applied
+
+
+FINGERPRINT_FILENAME = "fingerprint.json"
+# The agent's two logs are opened by launchd, append-only; past this size the
+# run keeps their newest part (truncating in place is safe with O_APPEND).
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_KEEP_BYTES = 512 * 1024
+
+
+def fingerprint(user_data):
+    """Cheap evidence of anything a sync would act on: the mtimes of every tree
+    directory, leaf, leaf folder and scheduled-tasks.json, of the app-wide
+    files, plus which account is loaded and whether the app runs."""
+    stamps = []
+    roots = [sessions_root(user_data)] + extra_roots(user_data)
+    for root in roots:
+        stamps.append(_mtime(root))
+        for account in _child_dirs(root):
+            stamps.append(_mtime(account))
+        for leaf in discover_leaves(root) if os.path.isdir(root) else ():
+            stamps.append(_mtime(leaf))
+            stamps.append(_mtime(tasks_path(leaf)))
+            for sub in LEAF_DIRS:
+                top = os.path.join(leaf, sub)
+                stamps.append(_mtime(top))
+                for dirpath, dirnames, _ in os.walk(top):
+                    for name in dirnames:
+                        stamps.append(_mtime(os.path.join(dirpath, name)))
+    for name in sorted({scope[1] for scope in APP_SCOPES} | {APP_CONFIG_FILENAME}):
+        stamps.append(_mtime(os.path.join(user_data, name)))
+    return {"stamps": stamps, "active": active_account(user_data),
+            "running": app_is_running()}
+
+
+def _mtime(path):
+    try:
+        return [path, os.lstat(path).st_mtime_ns]
+    except OSError:
+        return [path, None]
+
+
+def unchanged_since_last_run(user_data, state_dir, now=None):
+    saved = load_state_json(state_dir, FINGERPRINT_FILENAME)
+    now = time.time() if now is None else now
+    if not saved or now - saved.get("at", 0) >= FULL_RUN_INTERVAL:
+        return False
+    return saved.get("fingerprint") == fingerprint(user_data)
+
+
+def save_fingerprint(user_data, state_dir):
+    save_state_json(state_dir, FINGERPRINT_FILENAME,
+                    {"at": time.time(), "fingerprint": fingerprint(user_data)})
+
+
+def rotate_logs(home=None):
+    for path in log_paths(home):
+        try:
+            if os.path.getsize(path) <= LOG_MAX_BYTES:
+                continue
+            with open(path, "rb") as handle:
+                handle.seek(-LOG_KEEP_BYTES, os.SEEK_END)
+                tail = handle.read()
+            tail = tail[tail.find(b"\n") + 1:]
+            with open(path, "r+b") as handle:
+                handle.write(tail)
+                handle.truncate(len(tail))
+        except OSError:
+            continue
 
 
 def _root_label(root, first):
@@ -2306,6 +2551,11 @@ def cmd_sync(args):
         return refused
     execute = bool(args.execute)
     user_data = os.path.dirname(root)
+    quiet = execute and bool(getattr(args, "if_changed", False))
+    if quiet:
+        rotate_logs()
+        if unchanged_since_last_run(user_data, state_dir):
+            return 0
     roots = [root] + extra_roots(user_data)
     # A dry run writes nothing at all, so it needs neither the lock nor the
     # state directory: it is the one command that must keep working while a
@@ -2318,6 +2568,8 @@ def cmd_sync(args):
             leaves = [leaf for result in results for leaf in result.plan.leaves]
             app_plan, app_backup, app_applied = sync_app_files(
                 user_data, leaves, state_dir, execute=execute)
+            if execute and quiet:
+                save_fingerprint(user_data, state_dir)
     except LockHeld as held:
         LOGGER.error("another run is already running (pid %s, lock file %s); "
                      "delete it if you are sure no run is in progress",
@@ -2328,6 +2580,8 @@ def cmd_sync(args):
                      "to put the backups and lock file somewhere writable",
                      unusable.path, unusable.error)
         return 2
+    if quiet and not any(result.applied for result in results) and not app_applied:
+        return 0
     mode = "execute" if execute else "dry-run"
     pending = False
     failed = False
@@ -2504,7 +2758,7 @@ def plist_dict(script_path, root, leaves, user_data=None, state_dir=None, home=N
     current leaf, so a brand-new account or org folder also fires the job (sync
     re-discovers leaves on every run regardless).
     """
-    argv = [SYSTEM_PYTHON, script_path, "sync", "--execute"]
+    argv = [SYSTEM_PYTHON, script_path, "sync", "--execute", "--if-changed"]
     if user_data:
         argv += ["--user-data", user_data]
     if state_dir:

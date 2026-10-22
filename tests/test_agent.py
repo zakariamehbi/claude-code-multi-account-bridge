@@ -37,14 +37,14 @@ class PlistContentTest(unittest.TestCase):
 
     def test_program_arguments_use_usr_bin_python3_and_an_absolute_script(self):
         argv = self.plist()["ProgramArguments"]
-        self.assertEqual(argv, ["/usr/bin/python3", SCRIPT, "sync", "--execute"])
+        self.assertEqual(argv, ["/usr/bin/python3", SCRIPT, "sync", "--execute", "--if-changed"])
         self.assertTrue(os.path.isabs(argv[1]))
 
     def test_program_arguments_carry_the_overrides_when_given(self):
         argv = self.plist(user_data="/synthetic/userData",
                           state_dir="/synthetic/state")["ProgramArguments"]
         self.assertEqual(argv, [
-            "/usr/bin/python3", SCRIPT, "sync", "--execute",
+            "/usr/bin/python3", SCRIPT, "sync", "--execute", "--if-changed",
             "--user-data", "/synthetic/userData",
             "--state-dir", "/synthetic/state"])
 
@@ -73,7 +73,7 @@ class PlistContentTest(unittest.TestCase):
         """The app reads its folder on account load, which writes nothing, so a
         switch made after a quiet stretch needs a run that no WatchPaths event
         triggers. A converged tree costs a run nothing (no writes, no backup)."""
-        self.assertEqual(self.plist()["StartInterval"], 60)
+        self.assertEqual(self.plist()["StartInterval"], bridge.START_INTERVAL)
 
     def test_log_paths_live_under_library_logs(self):
         parsed = self.plist()

@@ -177,3 +177,28 @@ class RunningAppTest(TasksCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PendingDeletionTest(TasksCase):
+    """Review #1: a deletion that cannot reach a held-back leaf must survive
+    until it can, not be undone by the stale copy on the next run."""
+
+    def test_a_delete_waits_for_the_held_back_leaf_instead_of_being_undone(self):
+        write_tasks(self.a, [task("x"), task("keep")], 5_000_000_000)
+        write_tasks(self.b, [task("x"), task("keep")], 5_000_000_000)
+        self.sync()
+        write_tasks(self.b, [task("keep")], 6_000_000_000)
+        self.set_active(tl.uid(1))
+
+        self.sync(app_running=True)
+        self.sync(app_running=True)
+
+        self.assertEqual(ids(self.b), ["keep"])
+        self.assertEqual(sorted(ids(self.a)), ["keep", "x"])
+
+        self.sync(app_running=False)
+
+        self.assertEqual(ids(self.a), ["keep"])
+        self.assertEqual(ids(self.b), ["keep"])
+        self.assertEqual(bridge.load_pending(self.state_dir, "tasks\n" + self.root),
+                         set())

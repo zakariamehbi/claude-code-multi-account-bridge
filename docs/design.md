@@ -136,10 +136,10 @@ platform for the agent commands, 4 `launchctl bootstrap` failed.
 
 `install-agent` writes `~/Library/LaunchAgents/com.claude-code-multi-account-bridge.plist`
 with `WatchPaths` on the `claude-code-sessions` root, every ACCOUNT directory and
-every current leaf, `ThrottleInterval 5` and a `StartInterval 60` floor (an
-account switch inside the app writes nothing to disk, so no WatchPaths event
-fires; a converged tree costs a run nothing), running `/usr/bin/python3
-<repo>/bridge.py sync --execute`. All three levels are needed because launchd
+every current leaf, `ThrottleInterval 5` and `StartInterval 10`, running
+`/usr/bin/python3 <repo>/bridge.py sync --execute --if-changed` (a fingerprint
+fast path; a full sync at least every 60 s — an account switch inside the app
+writes nothing to disk, so no WatchPaths event fires). All three levels are needed because launchd
 fires on a change to a watched directory's own contents: a new account changes
 the root, but a new org folder under an existing account only changes that
 account's directory. Sync re-discovers leaves on every run regardless, and the

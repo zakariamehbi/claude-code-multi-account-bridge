@@ -1,6 +1,7 @@
 """Leaf folders, app-wide files and the Cowork tree, on synthetic trees."""
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -204,8 +205,7 @@ class AppFilesTest(StateCase):
 
         _, backup, applied = self.sync_app()
         self.assertEqual(applied["app_files_written"], 1)
-        with open(os.path.join(backup, bridge.APP_FILES_BACKUP_DIRNAME,
-                               "claude_desktop_config.json"), "rb") as handle:
+        with open(os.path.join(backup, "claude_desktop_config.json"), "rb") as handle:
             self.assertEqual(handle.read(), original)
 
     def test_the_file_keeps_its_indent(self):
@@ -247,3 +247,245 @@ class CoworkTreeTest(StateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BackupRingTest(StateCase):
+    def backups(self):
+        root = os.path.join(self.state_dir, bridge.BACKUPS_DIRNAME)
+        return sorted(os.listdir(root)) if os.path.isdir(root) else []
+
+    def test_one_full_snapshot_then_only_the_files_a_run_overwrites(self):
+        sid = tl.uid(5)
+        tl.write_record(self.a, sid, mtime_ns=5_000_000_000, title="one")
+        self.sync()
+        stale = tl.write_record(self.b, sid, mtime_ns=4_000_000_000, title="old")
+        with open(stale, "rb") as handle:
+            stale_bytes = handle.read()
+        tl.write_record(self.a, sid, mtime_ns=6_000_000_000, title="two")
+
+        self.sync()
+
+        full, changes = self.backups()
+        self.assertTrue(changes.endswith(bridge.CHANGES_SUFFIX))
+        saved = os.path.join(self.state_dir, bridge.BACKUPS_DIRNAME, changes,
+                             os.path.relpath(stale, self.base))
+        with open(saved, "rb") as handle:
+            self.assertEqual(handle.read(), stale_bytes)
+        self.assertEqual(sorted(os.listdir(os.path.join(
+            self.state_dir, bridge.BACKUPS_DIRNAME, changes))),
+            [bridge.SESSIONS_DIRNAME])
+
+    def test_a_day_old_full_snapshot_is_renewed(self):
+        old = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        os.makedirs(os.path.join(self.state_dir, bridge.BACKUPS_DIRNAME,
+                                 old.strftime(bridge.STAMP_FORMAT),
+                                 bridge.SESSIONS_DIRNAME))
+        self.assertTrue(bridge.needs_full_backup(self.root, self.state_dir))
+
+    def test_the_two_rings_are_pruned_separately(self):
+        root = os.path.join(self.state_dir, bridge.BACKUPS_DIRNAME)
+        for index in range(3):
+            os.makedirs(os.path.join(root, "20200101T0000%02d000000Z" % index))
+            os.makedirs(os.path.join(root, "20200102T0000%02d000000Z%s" % (
+                index, bridge.CHANGES_SUFFIX)))
+
+        bridge.prune_backups(root, keep=1, changes_kept=2)
+
+        self.assertEqual(self.backups(), [
+            "20200101T000002000000Z",
+            "20200102T000001000000Z" + bridge.CHANGES_SUFFIX,
+            "20200102T000002000000Z" + bridge.CHANGES_SUFFIX])
+
+
+class AgentFastPathTest(StateCase):
+    def run_agent(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = bridge.main(["sync", "--execute", "--if-changed", "--user-data",
+                                self.base, "--state-dir", self.state_dir])
+        return code, out.getvalue()
+
+    def test_a_quiet_tree_prints_nothing_and_a_change_is_picked_up(self):
+        code, out = self.run_agent()
+        self.assertEqual((code, out), (0, ""))
+        sid = tl.uid(5)
+        tl.write_record(self.a, sid, mtime_ns=5_000_000_000)
+
+        code, out = self.run_agent()
+
+        self.assertEqual(code, 0)
+        self.assertIn("copies_written=1", out)
+        self.assertTrue(os.path.exists(os.path.join(self.b, "local_%s.json" % sid)))
+
+    def test_an_unchanged_tree_skips_the_run(self):
+        self.run_agent()
+        self.assertTrue(bridge.unchanged_since_last_run(self.base, self.state_dir))
+        tl.write_record(self.a, tl.uid(5), mtime_ns=5_000_000_000)
+        self.assertFalse(bridge.unchanged_since_last_run(self.base, self.state_dir))
+
+    def test_a_full_run_still_happens_every_interval(self):
+        self.run_agent()
+        later = __import__("time").time() + bridge.FULL_RUN_INTERVAL + 1
+        self.assertFalse(bridge.unchanged_since_last_run(self.base, self.state_dir,
+                                                          now=later))
+
+
+class LogRotationTest(unittest.TestCase):
+    def test_a_large_log_keeps_its_newest_lines(self):
+        home = tempfile.mkdtemp(prefix="bridge-test-")
+        self.addCleanup(shutil.rmtree, home, True)
+        out_path, _ = bridge.log_paths(home)
+        os.makedirs(os.path.dirname(out_path))
+        with open(out_path, "wb") as handle:
+            handle.write(b"old line\n" * (bridge.LOG_MAX_BYTES // 9 + 10))
+            handle.write(b"newest line\n")
+
+        bridge.rotate_logs(home)
+
+        with open(out_path, "rb") as handle:
+            kept = handle.read()
+        self.assertLessEqual(len(kept), bridge.LOG_KEEP_BYTES)
+        self.assertTrue(kept.endswith(b"newest line\n"))
+        self.assertTrue(kept.startswith(b"old line\n"))
+
+
+class LeafFolderReviewTest(StateCase):
+    def test_a_consumed_message_is_not_resent_after_a_held_back_run(self):
+        """Review #2."""
+        path = queued(self.a, tl.uid(5), 5_000_000_000)
+        self.sync()
+        self.set_active(A)
+        os.unlink(os.path.join(self.b, "waiting-input", os.path.basename(path)))
+
+        self.sync(app_running=True)
+        self.sync(app_running=True)
+        self.assertEqual(os.listdir(os.path.join(self.b, "waiting-input")), [])
+
+        self.sync(app_running=False)
+        self.assertFalse(os.path.exists(path))
+
+    def test_an_unlistable_subfolder_deletes_nothing_elsewhere(self):
+        """Review #3."""
+        for leaf in (self.a, self.b):
+            tl.write_other(os.path.join(leaf, "memory", "notes"), "n.md", b"x",
+                           5_000_000_000)
+        self.sync()
+        locked = os.path.join(self.a, "memory", "notes")
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+
+        with self.assertLogs(bridge.LOGGER, level="WARNING"):
+            result = self.sync()
+
+        self.assertEqual((result.dirs.deletes, result.dirs.deleted), ((), ()))
+        self.assertTrue(os.path.exists(os.path.join(self.b, "memory", "notes", "n.md")))
+
+    def test_a_folder_the_app_removed_counts_as_emptied(self):
+        """Review #4: the app removes an empty waiting-input/."""
+        path = queued(self.a, tl.uid(5), 5_000_000_000)
+        self.sync()
+        os.unlink(path)
+        os.rmdir(os.path.dirname(path))
+
+        self.sync()
+
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(os.listdir(os.path.join(self.b, "waiting-input")), [])
+
+    def test_a_symlinked_folder_is_left_alone_and_never_written_through(self):
+        """Review #7."""
+        outside = os.path.join(self.base, "outside")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(self.b, "memory"))
+        tl.write_other(os.path.join(self.a, "memory", "sub"), "s.md", b"x",
+                       5_000_000_000)
+
+        with self.assertLogs(bridge.LOGGER, level="WARNING"):
+            first = self.sync()
+        with self.assertLogs(bridge.LOGGER, level="WARNING"):
+            second = self.sync()
+
+        self.assertEqual(os.listdir(outside), [])
+        self.assertEqual(first.dirs.writes, ())
+        self.assertEqual(second.dirs.writes, ())
+
+    def test_temp_files_inside_leaf_folders_are_swept(self):
+        """Review #10."""
+        stale = tl.write_other(os.path.join(self.a, "memory", "sub"),
+                               bridge.TEMP_PREFIX + "1-x", b"half")
+
+        with self.assertLogs(bridge.LOGGER, level="WARNING"):
+            self.sync()
+
+        self.assertFalse(os.path.exists(stale))
+
+
+class AppFilesReviewTest(StateCase):
+    def fallback(self):
+        return self.read_json("claude_desktop_config.json")["preferences"][
+            "coworkModelAutoFallbackByAccount"]
+
+    def write_fallback(self, values):
+        self.write_json("claude_desktop_config.json", {"preferences": {
+            "coworkModelAutoFallbackByAccount": values}})
+
+    def test_a_change_made_while_the_app_runs_survives_until_it_quits(self):
+        """Review #5a."""
+        self.write_fallback({A: False, B: False})
+        self.sync_app()
+        self.write_fallback({A: True, B: False})
+        self.set_active(B)
+
+        self.sync_app(app_running=True)
+        self.sync_app(app_running=False)
+
+        self.assertEqual(self.fallback(), {A: True, B: True})
+
+    def test_a_preset_deleted_while_the_app_runs_stays_deleted(self):
+        """Review #5b."""
+        self.write_json("ccd-session-presets.json", {"byAccount": {
+            A: {"presets": [{"id": "p1"}, {"id": "p2"}]},
+            B: {"presets": [{"id": "p1"}, {"id": "p2"}]}}})
+        self.sync_app()
+        data = self.read_json("ccd-session-presets.json")
+        data["byAccount"][A]["presets"] = [{"id": "p1"}]
+        self.write_json("ccd-session-presets.json", data)
+
+        self.sync_app(app_running=True)
+        self.sync_app(app_running=False)
+
+        for account in (A, B):
+            self.assertEqual(self.read_json("ccd-session-presets.json")[
+                "byAccount"][account]["presets"], [{"id": "p1"}])
+
+    def test_a_new_accounts_default_does_not_overwrite_the_others(self):
+        """Review #6."""
+        self.write_fallback({A: True, B: True})
+        self.sync_app()
+        c = tl.make_leaf(self.base, tl.uid(3), tl.uid(33))
+        self.write_fallback({A: True, B: True, tl.uid(3): False})
+        self.set_active(tl.uid(3))
+
+        bridge.sync_app_files(self.base, [self.a, self.b, c], self.state_dir,
+                              execute=True, app_running=False)
+
+        self.assertEqual(self.fallback(), {A: True, B: True, tl.uid(3): True})
+
+    def test_mixed_last_used_types_do_not_crash(self):
+        """Review #8."""
+        self.write_json("ccd-session-presets.json", {"byAccount": {
+            A: {"presets": [{"id": "p", "lastUsedAt": "yesterday"}]},
+            B: {"presets": [{"id": "p", "lastUsedAt": 5}]}}})
+
+        self.sync_app()
+
+        self.assertEqual(self.read_json("ccd-session-presets.json")[
+            "byAccount"][A]["presets"], [{"id": "p", "lastUsedAt": 5}])
+
+
+class UnknownAccountTest(StateCase):
+    def test_every_leaf_is_held_while_the_app_runs_with_no_known_account(self):
+        """Review #9."""
+        self.assertEqual(bridge.held_back_leaves(self.root, [self.a, self.b],
+                                                 app_running=True),
+                         (self.a, self.b))

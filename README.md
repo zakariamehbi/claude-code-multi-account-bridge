@@ -150,10 +150,15 @@ python3 bridge.py uninstall-agent   # unload it and delete the plist
 `install-agent` writes
 `~/Library/LaunchAgents/com.claude-code-multi-account-bridge.plist` with
 `WatchPaths` on the sessions root, **every account folder** and every current
-leaf folder, `ThrottleInterval 5` and a `StartInterval 60` floor (a run every
-minute even when nothing changed on disk — switching accounts inside the app
-writes nothing, and a converged tree costs a run nothing), running
-`/usr/bin/python3 <repo>/bridge.py sync --execute`. All three levels are watched because launchd fires on a change
+leaf folder, `ThrottleInterval 5` and `StartInterval 10`, running
+`/usr/bin/python3 <repo>/bridge.py sync --execute --if-changed`. Every 10 s the
+job checks a cheap fingerprint (folder and file mtimes, which account the app has
+loaded, whether it is running) and exits at once when nothing moved; otherwise,
+and at least once a minute regardless, it does a full sync. That is what notices,
+within seconds, an account switch (which writes nothing to disk) and the app
+quitting (the moment held-back writes can land). `--if-changed` also keeps the
+logs to runs that actually did something, and trims each log to its newest
+512 KB once it passes 5 MB. All three levels are watched because launchd fires on a change
 to a watched folder's *own* contents: a new account shows up as a change to the
 root, but a new **org** folder under an account that already exists only shows
 up as a change to that account folder. `sync` re-discovers leaves on every run
@@ -267,10 +272,14 @@ left exactly as it was.
   `--execute`. A dry run takes no lock and creates no state directory — it is
   the one command that still works while something else holds the lock, which
   is how you find out what is going on.
-- **A backup precedes the first write of a run.** The whole
-  `claude-code-sessions` tree is copied to
+- **A backup precedes the first write of a run.** Once a day the whole tree
+  (`claude-code-sessions`, or the Cowork tree) is copied to
   `~/.claude-code-multi-account-bridge/backups/<UTC timestamp>/`, keeping the
-  newest 10, with every file's bytes and exact mtime preserved. No backup is
+  newest 10; every other run that writes copies just the files it is about to
+  overwrite or remove to `backups/<UTC timestamp>-changes/` (same relative
+  paths, newest 2000 kept), app-wide files included. Every copy keeps the file's
+  bytes and exact mtime. (A full copy per run was ~100 MB and kept only minutes
+  of history on a busy day.) No backup is
   taken for a dry run, or when there is nothing to do. Anything this tool already
   reported as **unreadable** — a record, a whole account/org folder, or a
   directory wearing a record's name that cannot be read either — is left out of
