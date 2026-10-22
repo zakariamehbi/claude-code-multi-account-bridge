@@ -236,6 +236,31 @@ account never shows, and never runs, on the other. `sync` merges that list:
 - A folder with no `scheduled-tasks.json`, or one in a shape this tool does not
   recognise, is left alone.
 
+## Everything else that is per account
+
+Beyond the session list and scheduled tasks, `sync` mirrors every other piece of
+per-account state that is yours rather than the server's:
+
+| What | Where | How |
+| --- | --- | --- |
+| Messages queued but not sent yet | `<leaf>/waiting-input/` | every file mirrored; newest wins; a file the app consumed is removed everywhere, so it is never sent twice |
+| Cowork memory | `<leaf>/memory/` | same as above |
+| The Cowork tree | `local-agent-mode-sessions/<account>/<org>/` | the same records, tombstones, scheduled tasks and folders, when the tree exists |
+| Sidebar sections (pinned, routines, grouping, collapsed) | `claude_desktop_config.json` `dframe-code-sections` | one layout for every account/org |
+| Per-account UI flags and Cowork model fallback | `claude_desktop_config.json` | per key |
+| Session presets | `ccd-session-presets.json` | presets merged by `id`, newest `lastUsedAt` wins; deletes carry across |
+| MCP tool toggles | `mcp-user-tool-toggles.json` | merged as a set; removals carry across |
+
+The leaf folders follow the scheduled-tasks rule: the loaded account's folders
+wait until the app quits. The three app-wide files are rewritten whole by the
+running app, so **they are only written while the app is not running**
+(`held_back` on the `app files:` line), each one copied to
+`backups/<timestamp>/app-files/` first, keeping the file's own indentation.
+They carry no timestamps, so the account whose value changed since the last
+`--execute` run wins; with no change on record, the account the app last loaded
+wins. Only the keys listed above are touched; every other key in those files is
+left exactly as it was.
+
 ## Safety
 
 - **Dry run is the default.** `sync` alone only reports; writing needs
@@ -295,7 +320,8 @@ account never shows, and never runs, on the other. `sync` merges that list:
   run. Without this the plan could never converge, which meant a full backup and
   a fresh temp file on every single run.
 - **Nothing else in the session folders is touched.** Only `local_<uuid>.json`,
-  `deleted_<uuid>` and `scheduled-tasks.json` are read or written. `backlog/`,
+  `deleted_<uuid>`, `scheduled-tasks.json`, `waiting-input/` and `memory/` are
+  read or written. `backlog/`,
   `spaces.json` and any other file in those folders are left exactly as they
   were — bytes and timestamps.
 - **What the tool removes, exhaustively.** In your session folders: a
@@ -379,8 +405,14 @@ as its own.
 ## Not in scope
 
 - claude.ai chat history (server-side, and genuinely per account).
-- `backlog/`, `spaces.json`, and every other per-account file.
-- The `local-agent-mode-sessions` tree — same layout, may be added later.
+- Sign-in material: `config.json` device tokens, `ant-device-registry.json`,
+  `remote-control-state.json` identities. Copying these would break sign-in.
+- What the app re-downloads per account: plugin and skill manifests (`rpm/`,
+  `skills-plugin/`), `plan-usage-history.json`.
+- The bypass-permissions settings (`bypassPermissions*ByAccount`): a safety
+  consent and an org gate, not a preference.
+- `archived-sessions.idx`: a cache the app rebuilds from the records' own
+  `isArchived` (it matches them exactly).
 - Live refresh of a running app.
 
 ## Development

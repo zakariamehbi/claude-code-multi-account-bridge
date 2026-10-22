@@ -173,8 +173,8 @@ than a write.
 ## Non-goals
 
 - claude.ai chat history (server-side per account).
-- `backlog/`, `spaces.json` and any other per-account files.
-- The `local-agent-mode-sessions` (Cowork) tree. Same layout; may be added later.
+- Sign-in material, server-downloaded manifests, the bypass-permissions
+  settings and `archived-sessions.idx` (see the README's "Not in scope").
 - Live refresh of a running app. The app shows merged records on its next account
   load or relaunch.
 

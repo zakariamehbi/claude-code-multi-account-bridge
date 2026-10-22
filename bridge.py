@@ -100,10 +100,13 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 
 __version__ = "0.1.0"
 
 SESSIONS_DIRNAME = "claude-code-sessions"
+# Cowork keeps the same <account>/<org> layout here.
+COWORK_DIRNAME = "local-agent-mode-sessions"
 LABEL = "com.claude-code-multi-account-bridge"
 RECORD_PREFIX = "local_"
 RECORD_SUFFIX = ".json"
@@ -645,7 +648,7 @@ LOCK_FILENAME = "bridge.lock"
 BACKUPS_KEPT = 10
 
 SyncResult = collections.namedtuple(
-    "SyncResult", "plan backup applied backup_skipped tasks")
+    "SyncResult", "plan backup applied backup_skipped tasks dirs")
 
 # What take_backup made: the directory, and how many paths it deliberately left
 # out because discovery had already reported them as unreadable (R2-NB2).
@@ -655,7 +658,8 @@ Backup = collections.namedtuple("Backup", "path skipped")
 def empty_applied(errors=0):
     """The applied-counts dict with nothing done (and optionally one failure)."""
     return {"copies_written": 0, "tombstones_copied": 0, "records_deleted": 0,
-            "tasks_written": 0, "skipped": 0, "errors": errors}
+            "tasks_written": 0, "dir_files_written": 0, "dir_files_deleted": 0,
+            "app_files_written": 0, "skipped": 0, "errors": errors}
 
 
 def default_state_dir():
@@ -930,7 +934,7 @@ def take_backup(root, state_dir, now=None, skip_paths=()):
     skipped = []
     try:
         try:
-            shutil.copytree(root, os.path.join(destination, SESSIONS_DIRNAME),
+            shutil.copytree(root, os.path.join(destination, os.path.basename(root)),
                             symlinks=True,
                             ignore=_skip_paths_ignore(skip_paths, skipped))
         except OSError as error:
@@ -1198,37 +1202,51 @@ def plan_scheduled_tasks(files, base, writable, held_back=()):
                      tasks=tuple(task[TASK_ID_FIELD] for task in tasks))
 
 
-def load_tasks_base(state_dir):
-    """{leaf: [task ids]} from the last --execute run; {} when there is none."""
+def load_state_json(state_dir, name):
+    """A JSON object this tool saved in the state directory; {} when absent."""
     try:
-        with open(os.path.join(state_dir, TASKS_BASE_FILENAME), "rb") as handle:
-            base = json.loads(handle.read().decode("utf-8"))
+        with open(os.path.join(state_dir, name), "rb") as handle:
+            data = json.loads(handle.read().decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return {}
-    if not isinstance(base, dict):
-        return {}
-    return {leaf: ids for leaf, ids in base.items() if isinstance(ids, list)}
+    return data if isinstance(data, dict) else {}
 
 
-def save_tasks_base(state_dir, leaves):
-    """Record what every leaf holds NOW, re-read after the writes landed."""
-    base = {}
-    for leaf in leaves:
-        entry = read_scheduled_tasks(leaf)
-        if entry is not None:
-            base[leaf] = sorted(_task_ids(entry))
-    path = os.path.join(state_dir, TASKS_BASE_FILENAME)
-    if not base and not os.path.exists(path):
+def save_state_json(state_dir, name, data):
+    path = os.path.join(state_dir, name)
+    if not data and not os.path.exists(path):
         return
     temp = path + ".tmp"
     try:
         os.makedirs(state_dir, exist_ok=True)
         with open(temp, "w") as handle:
-            json.dump(base, handle, indent=2, sort_keys=True)
+            json.dump(data, handle, indent=2, sort_keys=True)
         os.replace(temp, path)
     except OSError as error:
         LOGGER.error("could not save %s: %s", path, error)
         _unlink_quietly(temp)
+
+
+def load_tasks_base(state_dir):
+    """{leaf: [task ids]} from the last --execute run; {} when there is none."""
+    base = load_state_json(state_dir, TASKS_BASE_FILENAME)
+    return {leaf: ids for leaf, ids in base.items() if isinstance(ids, list)}
+
+
+def save_tasks_base(state_dir, leaves):
+    """Record what these leaves hold NOW, re-read after the writes landed.
+
+    Entries for leaves of another root (the Cowork tree shares this file) are
+    kept as they are.
+    """
+    base = load_tasks_base(state_dir)
+    for leaf in leaves:
+        entry = read_scheduled_tasks(leaf)
+        if entry is not None:
+            base[leaf] = sorted(_task_ids(entry))
+        else:
+            base.pop(leaf, None)
+    save_state_json(state_dir, TASKS_BASE_FILENAME, base)
 
 
 def active_account(user_data):
@@ -1244,7 +1262,7 @@ def active_account(user_data):
 
 def app_is_running(platform=None):
     """Whether the desktop app is running. Unknown counts as running: holding a
-    write back costs a delay, writing under a running app can cost tasks."""
+    write back costs a delay, writing under a running app can cost data."""
     platform = sys.platform if platform is None else platform
     if platform != "darwin":
         return True
@@ -1259,7 +1277,20 @@ def app_is_running(platform=None):
                for line in listing.stdout.decode("utf-8", "replace").splitlines())
 
 
-def gather_scheduled_tasks(root, plan, state_dir, app_running=None):
+def held_back_leaves(root, leaves, app_running=None):
+    """Leaves of the account the running app has loaded: written only once it quits."""
+    account = active_account(os.path.dirname(root))
+    if account is None:
+        return ()
+    if app_running is None:
+        app_running = app_is_running()
+    if not app_running:
+        return ()
+    return tuple(leaf for leaf in leaves
+                 if os.path.basename(os.path.dirname(leaf)).lower() == account)
+
+
+def gather_scheduled_tasks(plan, state_dir, held_back):
     """Read, then plan, the scheduled-tasks merge for the leaves of `plan`."""
     files = {}
     for leaf in plan.leaves:
@@ -1268,14 +1299,6 @@ def gather_scheduled_tasks(root, plan, state_dir, app_running=None):
             files[leaf] = entry
     blocked = {path for path, _ in plan.blocked_leaves}
     writable = [leaf for leaf in plan.leaves if leaf not in blocked]
-    held_back = ()
-    account = active_account(os.path.dirname(root))
-    if account is not None:
-        if app_running is None:
-            app_running = app_is_running()
-        if app_running:
-            held_back = [leaf for leaf in plan.leaves
-                         if os.path.basename(os.path.dirname(leaf)).lower() == account]
     return plan_scheduled_tasks(files, load_tasks_base(state_dir), writable,
                                 held_back)
 
@@ -1286,13 +1309,199 @@ def log_tasks_findings(tasks_plan):
                     "everywhere: %s", task_id)
     for leaf in tasks_plan.held_back:
         LOGGER.debug("scheduled tasks held back while the app has this account "
-                    "loaded; written once it quits: %s", tasks_path(leaf))
+                     "loaded; written once it quits: %s", tasks_path(leaf))
 
 
 def format_tasks_counts(tasks_plan):
     return "tasks=%d files=%d writes=%d deleted=%d held_back=%d" % (
         len(tasks_plan.tasks), len(tasks_plan.files), len(tasks_plan.writes),
         len(tasks_plan.deleted), len(tasks_plan.held_back))
+
+
+# ---------------------------------------------------------------- leaf folders
+#
+# Folders inside a leaf whose files are per-account state the app keeps beside
+# the records: waiting-input/ holds messages queued for a session but not yet
+# sent (one local_<id>.json per session), memory/ is Cowork's memory. Every
+# regular file in them is mirrored by relative path: newest mtime wins, and a
+# file a leaf held after the last --execute run and no longer holds was
+# consumed or deleted there, so it is removed everywhere. Without that, a
+# queued message the app already sent would be restored on the other account
+# and sent again. The loaded account's leaves wait for the app to quit, like
+# scheduled-tasks.json: the app owns those folders while it runs.
+
+LEAF_DIRS = ("waiting-input", "memory")
+DIRS_BASE_FILENAME = "leaf-dirs-base.json"
+
+DirsPlan = collections.namedtuple(
+    "DirsPlan", "files writes deletes deleted held_back")
+
+
+def _dir_key(leaf, sub):
+    return leaf + "\n" + sub
+
+
+def read_leaf_dir(leaf, sub):
+    """{relative path: FileEntry} for every regular file under leaf/sub.
+
+    None when leaf/sub is not a real directory (absent, or a symlink): such a
+    folder is a destination only if some other leaf has files for it. Symlinks
+    and this tool's own temp files are never read; an unreadable file is left
+    out and logged, and its path is returned in the second slot so nothing is
+    planned for it anywhere.
+    """
+    top = os.path.join(leaf, sub)
+    if os.path.islink(top) or not os.path.isdir(top):
+        return None, ()
+    files = {}
+    blocked = []
+    pending = [""]
+    while pending:
+        rel_dir = pending.pop()
+        try:
+            with os.scandir(os.path.join(top, rel_dir)) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+        except OSError as error:
+            LOGGER.warning("cannot list %s: %s", os.path.join(top, rel_dir), error)
+            blocked.append(rel_dir)
+            continue
+        for entry in children:
+            rel = os.path.join(rel_dir, entry.name) if rel_dir else entry.name
+            if entry.name.startswith(TEMP_PREFIX) or entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(rel)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            item, _ = _read_entry(entry.path, parse=False, name=entry.name)
+            if item is None:
+                blocked.append(rel)
+            else:
+                files[rel] = item
+    return files, tuple(blocked)
+
+
+def plan_leaf_dirs(dirs, base, writable, held_back=()):
+    """Pure merge of the LEAF_DIRS folders. Touches no filesystem.
+
+    dirs: {(leaf, sub): ({rel: FileEntry} or None, blocked rels)}; base:
+    {_dir_key(leaf, sub): [rels]} from the last --execute run.
+    """
+    writes = []
+    deletes = []
+    held = set()
+    deleted_all = []
+    file_count = 0
+    for sub in LEAF_DIRS:
+        present = {leaf: files for (leaf, s), (files, _) in dirs.items()
+                   if s == sub and files is not None}
+        blocked = {rel for (leaf, s), (_, rels) in dirs.items() if s == sub
+                   for rel in rels}
+        deleted = set()
+        for leaf, files in present.items():
+            known = base.get(_dir_key(leaf, sub))
+            if isinstance(known, list):
+                deleted |= set(known) - set(files)
+        deleted -= blocked
+        rels = {rel for files in present.values() for rel in files} - deleted - blocked
+        if not rels and not deleted:
+            continue
+        file_count += len(rels)
+        deleted_all.extend(os.path.join(sub, rel) for rel in sorted(deleted))
+        for rel in sorted(rels):
+            holders = [(leaf, files[rel]) for leaf, files in present.items()
+                       if rel in files]
+            source_leaf, winner = max(holders, key=lambda pair: (
+                pair[1].mtime_ns, pair[1].digest, pair[0]))
+            for leaf in writable:
+                current = present.get(leaf, {}).get(rel)
+                if (current is not None and current.content == winner.content
+                        and current.mtime_ns == winner.mtime_ns):
+                    continue
+                if leaf in held_back:
+                    held.add(leaf)
+                    continue
+                expected = (ABSENT if current is None
+                            else (current.mtime_ns, current.digest))
+                writes.append(Write(os.path.join(leaf, sub, rel), winner.content,
+                                    winner.mtime_ns,
+                                    os.path.join(source_leaf, sub, rel),
+                                    "leaf-dir", expected))
+        for rel in sorted(deleted):
+            for leaf in writable:
+                if rel not in present.get(leaf, {}):
+                    continue
+                if leaf in held_back:
+                    held.add(leaf)
+                    continue
+                deletes.append(Delete(os.path.join(leaf, sub, rel), None, sub))
+    return DirsPlan(files=file_count, writes=tuple(sorted(writes, key=lambda w: w.dest)),
+                    deletes=tuple(sorted(deletes, key=lambda d: d.path)),
+                    deleted=tuple(deleted_all), held_back=tuple(sorted(held)))
+
+
+def gather_leaf_dirs(plan, state_dir, held_back):
+    dirs = {}
+    for leaf in plan.leaves:
+        for sub in LEAF_DIRS:
+            dirs[(leaf, sub)] = read_leaf_dir(leaf, sub)
+    blocked = {path for path, _ in plan.blocked_leaves}
+    writable = [leaf for leaf in plan.leaves if leaf not in blocked]
+    return plan_leaf_dirs(dirs, load_state_json(state_dir, DIRS_BASE_FILENAME),
+                          writable, held_back)
+
+
+def save_dirs_base(state_dir, leaves):
+    base = load_state_json(state_dir, DIRS_BASE_FILENAME)
+    for leaf in leaves:
+        for sub in LEAF_DIRS:
+            files, _ = read_leaf_dir(leaf, sub)
+            if files is None:
+                base.pop(_dir_key(leaf, sub), None)
+            else:
+                base[_dir_key(leaf, sub)] = sorted(files)
+    save_state_json(state_dir, DIRS_BASE_FILENAME, base)
+
+
+def _apply_dir_write(write, applied):
+    parent = os.path.dirname(write.dest)
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as error:
+        LOGGER.error("cannot create %s: %s", parent, error)
+        applied["errors"] += 1
+        return
+    _apply_write(write, applied, "dir_files_written")
+
+
+def _apply_dir_delete(delete, applied):
+    """Remove a mirrored file, refusing anything outside LEAF_DIRS or not a
+    regular file: the planner cannot produce one, this is the last guard."""
+    parts = os.path.normpath(delete.path).split(os.sep)
+    inside = any(sub in parts[:-1] for sub in LEAF_DIRS) and ".." not in parts
+    try:
+        regular = stat.S_ISREG(os.lstat(delete.path).st_mode)
+    except FileNotFoundError:
+        return
+    except OSError:
+        regular = False
+    if not inside or not regular:
+        LOGGER.error("refusing to delete %s: not a regular file inside %s",
+                     delete.path, "/".join(LEAF_DIRS))
+        applied["skipped"] += 1
+        return
+    if _unlink_quietly(delete.path):
+        applied["dir_files_deleted"] += 1
+        LOGGER.debug("deleted %s (removed on another account)", delete.path)
+    else:
+        applied["errors"] += 1
+
+
+def format_dirs_counts(dirs_plan):
+    return "files=%d writes=%d deletes=%d held_back=%d" % (
+        dirs_plan.files, len(dirs_plan.writes), len(dirs_plan.deletes),
+        len(dirs_plan.held_back))
 
 
 def sync_once(root, execute=False, state_dir=None, app_running=None):
@@ -1303,35 +1512,359 @@ def sync_once(root, execute=False, state_dir=None, app_running=None):
     stale-temp-file sweep is the one thing an --execute run does even with
     nothing to apply: it holds the lock, so it is the only safe moment, and a
     converged tree is exactly where a leftover would otherwise sit for ever.
-    The scheduled-tasks base is saved on every --execute run, writes or not:
-    it is what tells a later run that a missing task was deleted.
+    The scheduled-tasks and leaf-folder bases are saved on every --execute run,
+    writes or not: they are what tells a later run that something missing was
+    deleted.
     """
     state_dir = state_dir or default_state_dir()
     plan = plan_sync(gather(root))
     log_plan_findings(plan)
-    tasks_plan = gather_scheduled_tasks(root, plan, state_dir, app_running)
+    held = held_back_leaves(root, plan.leaves, app_running)
+    tasks_plan = gather_scheduled_tasks(plan, state_dir, held)
     log_tasks_findings(tasks_plan)
+    dirs_plan = gather_leaf_dirs(plan, state_dir, held)
+    result = SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0,
+                        tasks=tasks_plan, dirs=dirs_plan)
     if not execute:
-        return SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0,
-                          tasks=tasks_plan)
+        return result
     sweep_stale_temp_files(plan.leaves)
-    if plan.is_empty() and not tasks_plan.writes:
+    if plan.is_empty() and not tasks_plan.writes and not (
+            dirs_plan.writes or dirs_plan.deletes):
         save_tasks_base(state_dir, plan.leaves)
-        return SyncResult(plan=plan, backup=None, applied=None, backup_skipped=0,
-                          tasks=tasks_plan)
+        save_dirs_base(state_dir, plan.leaves)
+        return result
     backup = take_backup(root, state_dir, skip_paths=unreadable_paths(plan))
     if backup is None:
         # No backup, no writes: the whole point of the backup is to be able to
         # undo what comes after it. take_backup has already said why.
-        return SyncResult(plan=plan, backup=None,
-                          applied=empty_applied(errors=1), backup_skipped=0,
-                          tasks=tasks_plan)
+        return result._replace(applied=empty_applied(errors=1))
     applied = apply_plan(plan)
     for write in tasks_plan.writes:
         _apply_write(write, applied, "tasks_written")
+    for write in dirs_plan.writes:
+        _apply_dir_write(write, applied)
+    for delete in dirs_plan.deletes:
+        _apply_dir_delete(delete, applied)
     save_tasks_base(state_dir, plan.leaves)
-    return SyncResult(plan=plan, backup=backup.path, applied=applied,
-                      backup_skipped=backup.skipped, tasks=tasks_plan)
+    save_dirs_base(state_dir, plan.leaves)
+    return result._replace(backup=backup.path, applied=applied,
+                           backup_skipped=backup.skipped)
+
+
+# ------------------------------------------------------------ app-wide files
+#
+# A few files at the top of userData hold per-account state under keys named
+# after the account (or account/org). Everything listed in APP_SCOPES is
+# merged across accounts; everything else in those files is never touched.
+#
+# Deliberately NOT here: sign-in material (config.json's device tokens,
+# ant-device-registry.json, remote-control-state.json identities), whatever
+# the app re-downloads from the server (plugin and skill manifests, plan usage
+# history), the bypass-permissions settings (a safety consent and an org gate,
+# not a preference), and caches the app rebuilds from the records
+# (archived-sessions.idx).
+#
+# The app keeps these files in memory and rewrites them whole, so they are only
+# ever written while it is not running. With no timestamps inside, "which copy
+# is newer" is decided against the value saved after the last --execute run:
+# the account whose value changed since then wins; with no change (or no saved
+# run yet), the loaded account's value wins, then the largest.
+
+APP_FILES_BASE_FILENAME = "app-files-base.json"
+APP_FILES_BACKUP_DIRNAME = "app-files"
+
+# (scope id, file, path to the map inside it, key kind, merge kind)
+#   key kind "account": the map's keys are account uuids;
+#            "account/org": "<account>/<org>", one per leaf of either tree;
+#            "suffix": "<name>.<account>" keys, one family per <name>.
+#   merge kind "value": the whole value is one unit;
+#              "presets": a dict whose "presets" list merges by "id";
+#              "set": a list of strings, merged as a set.
+APP_SCOPES = (
+    ("code-sections", "claude_desktop_config.json",
+     ("preferences", "epitaxyPrefs", "dframe-code-sections"), "account/org", "value"),
+    ("epitaxy-flags", "claude_desktop_config.json",
+     ("preferences", "epitaxyPrefs"), "suffix", "value"),
+    ("cowork-model-fallback", "claude_desktop_config.json",
+     ("preferences", "coworkModelAutoFallbackByAccount"), "account", "value"),
+    ("session-presets", "ccd-session-presets.json", ("byAccount",), "account",
+     "presets"),
+    ("mcp-tool-toggles", "mcp-user-tool-toggles.json", ("owners",), "account",
+     "set"),
+)
+
+AppFilesPlan = collections.namedtuple(
+    "AppFilesPlan", "files writes changed held_back")
+
+
+def _digest_value(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _json_indent(content):
+    """The indent the app wrote the file with, so a rewrite diffs minimally."""
+    for line in content.decode("utf-8", "replace").splitlines()[1:2]:
+        stripped = line.lstrip(" \t")
+        prefix = line[:len(line) - len(stripped)]
+        if prefix.startswith("\t"):
+            return "\t"
+        if prefix:
+            return len(prefix)
+    return None
+
+
+def _dig(data, path, create=False):
+    node = data
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        if key not in node:
+            if not create:
+                return None
+            node[key] = {}
+        node = node[key]
+    return node if isinstance(node, dict) else None
+
+
+def _scope_families(node, key_kind, accounts, account_orgs):
+    """{family: {key: account}}: the keys that must all hold one merged value."""
+    if key_kind == "account":
+        return {"": {account: account for account in accounts}}
+    if key_kind == "account/org":
+        return {"": {"%s/%s" % pair: pair[0] for pair in account_orgs}}
+    families = {}
+    for key in node:
+        name, _, account = key.rpartition(".")
+        if name and is_uuid(account) and account.lower() in accounts:
+            families.setdefault(name, {})
+    for name in families:
+        families[name] = {"%s.%s" % (name, account): account for account in accounts}
+    return families
+
+
+def _merge_values(values, base, merge_kind, active):
+    """One merged value for a family. values: {key: (account, value)}."""
+    changed = sorted(key for key, (_, value) in values.items()
+                     if base.get(key) != _digest_value(value))
+    if base and changed:
+        pool = changed
+    else:
+        pool = sorted(values)
+
+    # With nothing to say which copy is newer, the account the app last loaded
+    # is the one the user has been looking at; then the copy holding more.
+    def rank(key):
+        account, value = values[key]
+        return (account == active, len(json.dumps(value, sort_keys=True)), key)
+
+    if merge_kind == "value":
+        return values[max(pool, key=rank)][1]
+    winner_key = max(pool, key=rank)
+    if merge_kind == "set":
+        deleted = set()
+        for key, (_, value) in values.items():
+            known = base.get(key + "\nitems")
+            if isinstance(known, list):
+                deleted |= set(known) - set(value)
+        merged = []
+        for key in [winner_key] + sorted(values):
+            for item in values[key][1]:
+                if item not in merged and item not in deleted:
+                    merged.append(item)
+        return merged
+    # presets: union the list by id, other keys from the winning value.
+    deleted = set()
+    for key, (_, value) in values.items():
+        known = base.get(key + "\nitems")
+        if isinstance(known, list):
+            deleted |= set(known) - {p.get("id") for p in value.get("presets", [])
+                                     if isinstance(p, dict)}
+    merged = dict(values[winner_key][1])
+    by_id = {}
+    order = []
+    for key in [winner_key] + sorted(values):
+        for preset in values[key][1].get("presets", []):
+            if not isinstance(preset, dict) or not isinstance(preset.get("id"), str):
+                continue
+            preset_id = preset["id"]
+            if preset_id in deleted:
+                continue
+            if preset_id not in by_id:
+                order.append(preset_id)
+                by_id[preset_id] = preset
+            elif (preset.get("lastUsedAt") or 0) > (by_id[preset_id].get("lastUsedAt") or 0):
+                by_id[preset_id] = preset
+    merged["presets"] = [by_id[preset_id] for preset_id in order]
+    return merged
+
+
+def _value_ok(value, merge_kind):
+    if merge_kind == "set":
+        return isinstance(value, list) and all(isinstance(v, str) for v in value)
+    if merge_kind == "presets":
+        return isinstance(value, dict) and isinstance(value.get("presets", []), list)
+    return True
+
+
+def _items(value, merge_kind):
+    if merge_kind == "set":
+        return sorted(value)
+    if merge_kind == "presets":
+        return sorted(p["id"] for p in value.get("presets", [])
+                      if isinstance(p, dict) and isinstance(p.get("id"), str))
+    return None
+
+
+def read_app_file(user_data, name):
+    path = os.path.join(user_data, name)
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+    except OSError:
+        return None
+    entry, _ = _read_entry(path, name=name)
+    if entry is None or entry.parsed is None:
+        return None
+    return entry
+
+
+def plan_app_files(files, accounts, account_orgs, base, active=None,
+                   app_running=False, now_ns=None):
+    """Pure merge of APP_SCOPES. files: {name: FileEntry}; accounts: account
+    uuids that have at least one leaf; account_orgs: (account, org) pairs.
+
+    Returns the new bytes for every file that changes; while the app runs they
+    are counted as held back instead.
+    """
+    new_data = {name: json.loads(entry.content.decode("utf-8"))
+                for name, entry in files.items()}
+    changed = []
+    for scope, name, path, key_kind, merge_kind in APP_SCOPES:
+        if name not in new_data:
+            continue
+        node = _dig(new_data[name], path)
+        if node is None:
+            continue
+        scope_base = base.get(scope, {})
+        for family, keys in sorted(_scope_families(node, key_kind, accounts,
+                                                   account_orgs).items()):
+            values = {key: (account, node[key]) for key, account in keys.items()
+                      if key in node and _value_ok(node[key], merge_kind)}
+            if not values or any(key in node and key not in values for key in keys):
+                continue
+            merged = _merge_values(values, scope_base, merge_kind, active)
+            for key in sorted(keys):
+                if key not in node or node[key] != merged:
+                    node[key] = merged
+                    changed.append((scope, key))
+    writes = []
+    held = []
+    for name, entry in sorted(files.items()):
+        original = json.loads(entry.content.decode("utf-8"))
+        if new_data[name] == original:
+            continue
+        if app_running:
+            held.append(name)
+            continue
+        text = json.dumps(new_data[name], indent=_json_indent(entry.content),
+                          ensure_ascii=False)
+        if entry.content.endswith(b"\n"):
+            text += "\n"
+        writes.append(Write(entry.name, text.encode("utf-8"), now_ns or 0,
+                            "merged", "app-file", (entry.mtime_ns, entry.digest)))
+    return AppFilesPlan(files=tuple(sorted(files)), writes=tuple(writes),
+                        changed=tuple(changed), held_back=tuple(held))
+
+
+def app_files_base(files, accounts, account_orgs):
+    """What every scoped key holds now, for the next run to compare against."""
+    base = {}
+    for scope, name, path, key_kind, merge_kind in APP_SCOPES:
+        if name not in files:
+            continue
+        node = _dig(files[name].parsed, path)
+        if node is None:
+            continue
+        entries = base.setdefault(scope, {})
+        for keys in _scope_families(node, key_kind, accounts, account_orgs).values():
+            for key in keys:
+                if key in node:
+                    entries[key] = _digest_value(node[key])
+                    items = (_items(node[key], merge_kind)
+                             if _value_ok(node[key], merge_kind) else None)
+                    if items is not None:
+                        entries[key + "\nitems"] = items
+    return base
+
+
+def _accounts_and_orgs(leaves):
+    pairs = sorted({(os.path.basename(os.path.dirname(leaf)).lower(),
+                     os.path.basename(leaf).lower()) for leaf in leaves})
+    return sorted({account for account, _ in pairs}), pairs
+
+
+def gather_app_files(user_data, leaves, state_dir, app_running=None):
+    files = {}
+    for name in sorted({scope[1] for scope in APP_SCOPES}):
+        entry = read_app_file(user_data, name)
+        if entry is not None:
+            files[name] = entry
+    accounts, pairs = _accounts_and_orgs(leaves)
+    if app_running is None and files:
+        app_running = app_is_running()
+    plan = plan_app_files(files, accounts, pairs,
+                          load_state_json(state_dir, APP_FILES_BASE_FILENAME),
+                          active=active_account(user_data),
+                          app_running=bool(app_running), now_ns=time.time_ns())
+    return plan._replace(writes=tuple(
+        write._replace(dest=os.path.join(user_data, write.dest))
+        for write in plan.writes))
+
+
+def save_app_files_base(user_data, leaves, state_dir):
+    files = {}
+    for name in sorted({scope[1] for scope in APP_SCOPES}):
+        entry = read_app_file(user_data, name)
+        if entry is not None:
+            files[name] = entry
+    accounts, pairs = _accounts_and_orgs(leaves)
+    save_state_json(state_dir, APP_FILES_BASE_FILENAME,
+                    app_files_base(files, accounts, pairs))
+
+
+def backup_app_files(state_dir, writes):
+    """Copy every app file about to be rewritten aside, bytes and mtime."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backups_root = os.path.join(state_dir, BACKUPS_DIRNAME)
+    destination = os.path.join(backups_root, stamp, APP_FILES_BACKUP_DIRNAME)
+    try:
+        os.makedirs(destination)
+        for write in writes:
+            shutil.copy2(write.dest, destination)
+    except OSError as error:
+        LOGGER.error("backup of the app files failed, nothing will be applied: %s",
+                     error)
+        _force_rmtree(os.path.dirname(destination))
+        return None
+    finally:
+        prune_backups(backups_root)
+    return os.path.dirname(destination)
+
+
+def format_app_counts(app_plan):
+    return "files=%d keys_changed=%d writes=%d held_back=%d" % (
+        len(app_plan.files), len(app_plan.changed), len(app_plan.writes),
+        len(app_plan.held_back))
+
+
+def cowork_root(user_data):
+    return os.path.join(user_data, COWORK_DIRNAME)
+
+
+def extra_roots(user_data):
+    """Trees with the same <account>/<org> layout, synced when present."""
+    root = cowork_root(user_data)
+    return [root] if os.path.isdir(root) and not os.path.islink(root) else []
 
 
 # --------------------------------------------------------------- environment
@@ -1738,19 +2271,53 @@ def _format_counts(counts):
     return " ".join("%s=%d" % (key, counts[key]) for key in order)
 
 
+def sync_app_files(user_data, leaves, state_dir, execute=False, app_running=None):
+    """Plan, and when executing back up and apply, the APP_SCOPES merge.
+
+    Returns (plan, backup directory or None, applied counts or None). The base
+    is saved on every --execute run, held back or not: it is what tells the
+    next run which account changed a value.
+    """
+    plan = gather_app_files(user_data, leaves, state_dir, app_running)
+    if not execute:
+        return plan, None, None
+    if not plan.writes:
+        if plan.files:
+            save_app_files_base(user_data, leaves, state_dir)
+        return plan, None, None
+    backup = backup_app_files(state_dir, plan.writes)
+    if backup is None:
+        return plan, None, empty_applied(errors=1)
+    applied = empty_applied()
+    for write in plan.writes:
+        _apply_write(write, applied, "app_files_written")
+    save_app_files_base(user_data, leaves, state_dir)
+    return plan, backup, applied
+
+
+def _root_label(root, first):
+    return "" if first else " " + os.path.basename(root)
+
+
 def cmd_sync(args):
     root, state_dir = _paths(args)
     refused = _refuse_bad_paths(root, state_dir)
     if refused is not None:
         return refused
     execute = bool(args.execute)
+    user_data = os.path.dirname(root)
+    roots = [root] + extra_roots(user_data)
     # A dry run writes nothing at all, so it needs neither the lock nor the
     # state directory: it is the one command that must keep working while a
     # lock is in place, because it is how you find out what is going on.
     guard = file_lock(state_dir) if execute else contextlib.nullcontext()
     try:
         with guard:
-            result = sync_once(root, execute=execute, state_dir=state_dir)
+            results = [sync_once(each, execute=execute, state_dir=state_dir)
+                       for each in roots]
+            leaves = [leaf for result in results for leaf in result.plan.leaves]
+            app_plan, app_backup, app_applied = sync_app_files(
+                user_data, leaves, state_dir, execute=execute)
     except LockHeld as held:
         LOGGER.error("another run is already running (pid %s, lock file %s); "
                      "delete it if you are sure no run is in progress",
@@ -1762,30 +2329,48 @@ def cmd_sync(args):
                      unusable.path, unusable.error)
         return 2
     mode = "execute" if execute else "dry-run"
-    print("sync (%s): %s" % (mode, _format_counts(result.plan.counts())))
-    if result.tasks.files:
-        print("scheduled tasks: %s" % format_tasks_counts(result.tasks))
-    if result.backup:
-        # `skipped` here counts paths left OUT OF THE BACKUP because they could
-        # not be read (R2-NB2) — not the `skipped` on the applied line below,
-        # which counts writes refused at the last moment.
-        print("backup: %s skipped=%d" % (result.backup, result.backup_skipped))
-    if not execute and not (result.plan.is_empty() and not result.tasks.writes):
+    pending = False
+    failed = False
+    for index, result in enumerate(results):
+        label = _root_label(roots[index], index == 0)
+        print("sync%s (%s): %s" % (label, mode, _format_counts(result.plan.counts())))
+        if result.tasks.files:
+            print("scheduled tasks%s: %s" % (label, format_tasks_counts(result.tasks)))
+        if result.dirs.files or result.dirs.deletes or result.dirs.held_back:
+            print("leaf folders%s: %s" % (label, format_dirs_counts(result.dirs)))
+        if result.backup:
+            # `skipped` here counts paths left OUT OF THE BACKUP because they
+            # could not be read (R2-NB2) — not the `skipped` on the applied
+            # line below, which counts writes refused at the last moment.
+            print("backup: %s skipped=%d" % (result.backup, result.backup_skipped))
+        pending = pending or not (result.plan.is_empty() and not result.tasks.writes
+                                  and not result.dirs.writes
+                                  and not result.dirs.deletes)
+        if result.applied:
+            # The plan says what SHOULD happen; this says what did. They differ
+            # when a write was refused at the last moment (the destination
+            # changed under us), when a delete was refused by the filename
+            # guard, or when something failed outright — none of which may
+            # ever be invisible.
+            print("applied: %s" % _format_applied(result.applied))
+            failed = failed or bool(result.applied["errors"])
+    if app_plan.files:
+        print("app files: %s" % format_app_counts(app_plan))
+        pending = pending or bool(app_plan.writes)
+    if app_backup:
+        print("backup: %s skipped=0" % app_backup)
+    if app_applied:
+        print("applied: %s" % _format_applied(app_applied))
+        failed = failed or bool(app_applied["errors"])
+    if not execute and pending:
         print("nothing was written; re-run with --execute to apply this plan")
-    if result.applied:
-        # The plan says what SHOULD happen; this says what did. They differ
-        # when a write was refused at the last moment (the destination changed
-        # under us), when a delete was refused by the filename guard, or when
-        # something failed outright — none of which may ever be invisible.
-        print("applied: %s" % _format_applied(result.applied))
-        if result.applied["errors"]:
-            return 1
-    return 0
+    return 1 if failed else 0
 
 
 def _format_applied(applied):
     order = ("copies_written", "tombstones_copied", "records_deleted",
-             "tasks_written", "skipped", "errors")
+             "tasks_written", "dir_files_written", "dir_files_deleted",
+             "app_files_written", "skipped", "errors")
     return " ".join("%s=%d" % (key, applied[key]) for key in order)
 
 
@@ -1809,13 +2394,32 @@ def cmd_status(args, runner):
     # something needed doing made "every leaf is in sync" mean two very
     # different things.
     print("counts: %s" % _format_counts(plan.counts()))
-    tasks_plan = gather_scheduled_tasks(root, plan, state_dir)
-    log_tasks_findings(tasks_plan)
-    print("scheduled tasks: %s" % format_tasks_counts(tasks_plan))
-    for write in tasks_plan.writes:
-        print("  would write  %s" % write.dest)
-    for leaf in tasks_plan.held_back:
-        print("  held back    %s (app has this account loaded)" % tasks_path(leaf))
+    user_data = os.path.dirname(root)
+    leaves = list(plan.leaves)
+    for index, each in enumerate([root] + extra_roots(user_data)):
+        result = sync_once(each, execute=False, state_dir=state_dir)
+        label = _root_label(each, index == 0)
+        if index:
+            leaves.extend(result.plan.leaves)
+            print("sync%s: %s" % (label, _format_counts(result.plan.counts())))
+            for write in result.plan.writes + result.plan.tombstone_copies:
+                print("  would write  %s" % write.dest)
+            for delete in result.plan.deletes:
+                print("  would delete %s" % delete.path)
+        print("scheduled tasks%s: %s" % (label, format_tasks_counts(result.tasks)))
+        print("leaf folders%s: %s" % (label, format_dirs_counts(result.dirs)))
+        for write in result.tasks.writes + result.dirs.writes:
+            print("  would write  %s" % write.dest)
+        for delete in result.dirs.deletes:
+            print("  would delete %s" % delete.path)
+        for leaf in sorted(set(result.tasks.held_back + result.dirs.held_back)):
+            print("  held back    %s (app has this account loaded)" % leaf)
+    app_plan, _, _ = sync_app_files(user_data, leaves, state_dir)
+    print("app files: %s" % format_app_counts(app_plan))
+    for scope, key in app_plan.changed:
+        print("  would merge  %s: %s" % (scope, key))
+    for name in app_plan.held_back:
+        print("  held back    %s (app is running)" % os.path.join(user_data, name))
     if plan.is_empty():
         print("drift: none - every leaf is in sync")
     else:
